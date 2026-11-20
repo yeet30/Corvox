@@ -18,20 +18,24 @@ use crate::config::{envs_dir, BenchResult};
 
 #[derive(Debug)]
 pub enum Event {
-    HelperReady { env: String },
-    HelperExited { env: String, msg: String },
+    /// `key` names one helper process: "main" speaks, "dl:<engine>" downloads a model in the background.
+    HelperReady { key: String },
+    HelperExited { key: String, msg: String },
+    HelperStatus { key: String, msg: String },
     Status(String),
     Chunk { req: u64, samples: Vec<f32>, sr: u32 },
     SpeakDone { req: u64, result: Result<(), String> },
-    LoadDone { model: String, result: Result<String, String> },
+    LoadDone { key: String, result: Result<String, String> },
     InstallLine { env: String, line: String },
     /// Megabytes unpacked into uv's cache so far (a good proxy for download progress).
     InstallProgress { env: String, mb: f32 },
     InstallDone { env: String, ok: bool, cancelled: bool },
-    ModelProgress { model: String, done_mb: f32 },
+    ModelProgress { key: String, done_mb: f32 },
     BenchStatus { model: String, msg: String },
     BenchDone { model: String, result: Result<BenchResult, String> },
     Hotkey,
+    VmicLine(String),
+    VmicDone { code: i32 },
 }
 
 pub type Tx = (Sender<Event>, eframe::egui::Context);
@@ -185,17 +189,19 @@ enum Kind {
     Other,
 }
 
+/// Request ids are unique across all helper processes, so audio from one never lands in another.
+static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
 /// A running engine helper process for one environment.
 pub struct Helper {
     pub env: String,
     child: Child,
     stdin: ChildStdin,
-    next_id: u64,
     pending: Arc<Mutex<HashMap<u64, (Kind, String)>>>,
 }
 
 impl Helper {
-    pub fn spawn(uv: &Path, engines: &Path, env: &str, agreed: bool, int8: bool, tx: Tx) -> anyhow::Result<Self> {
+    pub fn spawn(uv: &Path, engines: &Path, env: &str, key: &str, agreed: bool, int8: bool, tx: Tx) -> anyhow::Result<Self> {
         let mut c = python_command(uv, engines, env, agreed, int8);
         c.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
         let mut child = c.spawn()?;
@@ -219,31 +225,30 @@ impl Helper {
             }
         });
 
-        let env_name = env.to_string();
+        let key_name = key.to_string();
         let pend = pending.clone();
         std::thread::spawn(move || {
             for line in BufReader::new(stdout).lines().map_while(Result::ok) {
                 let Ok(v) = serde_json::from_str::<Value>(&line) else { continue };
-                handle_line(&v, &env_name, &pend, &tx);
+                handle_line(&v, &key_name, &pend, &tx);
             }
             let last = tail.lock().unwrap().iter().rev().find(|l| !l.trim().is_empty()).cloned().unwrap_or_default();
-            for (id, (kind, model)) in pend.lock().unwrap().drain() {
+            for (id, (kind, _model)) in pend.lock().unwrap().drain() {
                 let err = format!("engine stopped: {last}");
                 match kind {
                     Kind::Speak => send(&tx, Event::SpeakDone { req: id, result: Err(err) }),
-                    Kind::Load => send(&tx, Event::LoadDone { model, result: Err(err) }),
+                    Kind::Load => send(&tx, Event::LoadDone { key: key_name.clone(), result: Err(err) }),
                     Kind::Other => {}
                 }
             }
-            send(&tx, Event::HelperExited { env: env_name, msg: last });
+            send(&tx, Event::HelperExited { key: key_name, msg: last });
         });
 
-        Ok(Self { env: env.to_string(), child, stdin, next_id: 1, pending })
+        Ok(Self { env: env.to_string(), child, stdin, pending })
     }
 
     fn request(&mut self, kind: Kind, model: &str, mut body: Value) -> anyhow::Result<u64> {
-        let id = self.next_id;
-        self.next_id += 1;
+        let id = NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         body["id"] = json!(id);
         self.pending.lock().unwrap().insert(id, (kind, model.to_string()));
         writeln!(self.stdin, "{body}")?;
@@ -297,15 +302,15 @@ fn decode_pcm16(b64: &str) -> Vec<f32> {
     bytes.chunks_exact(2).map(|b| i16::from_le_bytes([b[0], b[1]]) as f32 / 32768.0).collect()
 }
 
-fn handle_line(v: &Value, env: &str, pending: &Arc<Mutex<HashMap<u64, (Kind, String)>>>, tx: &Tx) {
+fn handle_line(v: &Value, key: &str, pending: &Arc<Mutex<HashMap<u64, (Kind, String)>>>, tx: &Tx) {
     if let Some(ev) = v.get("event").and_then(|e| e.as_str()) {
         match ev {
-            "ready" => send(tx, Event::HelperReady { env: env.to_string() }),
-            "status" => send(tx, Event::Status(v["msg"].as_str().unwrap_or("").to_string())),
+            "ready" => send(tx, Event::HelperReady { key: key.to_string() }),
+            "status" => send(tx, Event::HelperStatus { key: key.to_string(), msg: v["msg"].as_str().unwrap_or("").to_string() }),
             "progress" => {
                 let id = v["id"].as_u64().unwrap_or(0);
-                if let Some((_, model)) = pending.lock().unwrap().get(&id).cloned() {
-                    send(tx, Event::ModelProgress { model, done_mb: v["done_mb"].as_f64().unwrap_or(0.0) as f32 });
+                if pending.lock().unwrap().contains_key(&id) {
+                    send(tx, Event::ModelProgress { key: key.to_string(), done_mb: v["done_mb"].as_f64().unwrap_or(0.0) as f32 });
                 }
             }
             "chunk" => send(
@@ -321,14 +326,17 @@ fn handle_line(v: &Value, env: &str, pending: &Arc<Mutex<HashMap<u64, (Kind, Str
         return;
     }
     let Some(id) = v.get("id").and_then(|i| i.as_u64()) else { return };
-    let Some((kind, model)) = pending.lock().unwrap().remove(&id) else { return };
+    let Some((kind, _model)) = pending.lock().unwrap().remove(&id) else { return };
     let ok = v["ok"].as_bool().unwrap_or(false);
     let err = v["error"].as_str().unwrap_or("unknown error").to_string();
     match kind {
         Kind::Speak => send(tx, Event::SpeakDone { req: id, result: if ok { Ok(()) } else { Err(err) } }),
         Kind::Load => send(
             tx,
-            Event::LoadDone { model, result: if ok { Ok(v["device"].as_str().unwrap_or("cpu").to_string()) } else { Err(err) } },
+            Event::LoadDone {
+                key: key.to_string(),
+                result: if ok { Ok(v["device"].as_str().unwrap_or("cpu").to_string()) } else { Err(err) },
+            },
         ),
         Kind::Other => {}
     }

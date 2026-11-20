@@ -3,7 +3,8 @@
 name = "corvox-env-chatterbox"
 version = "0.1.0"
 requires-python = ">=3.10,<3.13"
-dependencies = ["corvox-engine", "chatterbox-tts", "torch", "torchaudio"]
+# resemble-perth (Chatterbox's watermarker) imports pkg_resources, removed in setuptools 81.
+dependencies = ["corvox-engine", "chatterbox-tts", "torch", "torchaudio", "setuptools<81"]
 
 [project.optional-dependencies]
 bench = ["corvox-engine[bench]"]

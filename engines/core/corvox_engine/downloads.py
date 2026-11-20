@@ -40,7 +40,10 @@ def _new_bytes(dirs: list[Path], since: float, baseline: dict[str, int]) -> int:
                     st = os.stat(p)
                 except OSError:
                     continue
-                if st.st_mtime >= since:
+                if f.endswith(".incomplete"):
+                    # partial downloads count fully, so a resumed download shows its real progress
+                    total += st.st_size
+                elif st.st_mtime >= since:
                     total += max(0, st.st_size - baseline.get(p, 0))
     return total
 

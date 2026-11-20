@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -9,16 +9,19 @@ use crate::audio::{self, Player};
 use crate::catalog::{find_engines_dir, find_uv, Catalog, Engine};
 use crate::config::{self, Config};
 use crate::engine::{self, CancelHandle, Event, Helper, Tx};
+use crate::i18n::{self, t, tf};
 use crate::icons::{self, Icon};
 use crate::platform;
 use crate::ptt::{self, Ptt};
+use crate::vmic;
 
 pub const APP_NAME: &str = "Corvox";
 pub const EXPANDED: Vec2 = Vec2::new(440.0, 400.0);
-pub const COLLAPSED: Vec2 = Vec2::new(460.0, 56.0);
+pub const COLLAPSED: Vec2 = Vec2::new(440.0, 56.0);
 
 /// Streamed audio is held back until this much is ready, so slow CPUs don't stutter mid-word.
 const PREBUFFER_SECS: f32 = 0.4;
+const MAIN: &str = "main";
 
 const RED: Color32 = Color32::from_rgb(0xE2, 0x4B, 0x4A);
 const AMBER: Color32 = Color32::from_rgb(0xEF, 0x9F, 0x27);
@@ -33,6 +36,32 @@ enum Page {
     Settings,
 }
 
+#[derive(Clone, PartialEq)]
+enum Status {
+    Ready,
+    StartingEngine,
+    Loading,
+    Generating,
+    Speaking,
+    SpeakingSaved,
+    /// Already-translated one-off message.
+    Msg(String),
+}
+
+impl Status {
+    fn text(&self) -> String {
+        match self {
+            Status::Ready => t("Ready").into(),
+            Status::StartingEngine => t("Starting engine…").into(),
+            Status::Loading => t("Loading the model…").into(),
+            Status::Generating => t("Generating…").into(),
+            Status::Speaking => t("Speaking").into(),
+            Status::SpeakingSaved => t("Speaking (saved audio)").into(),
+            Status::Msg(m) => m.clone(),
+        }
+    }
+}
+
 struct Install {
     started: Instant,
     mb: f32,
@@ -40,12 +69,32 @@ struct Install {
     handle: CancelHandle,
 }
 
-/// Audio of the current request waiting for the prebuffer to fill.
+/// One helper process. "main" speaks; "dl:<model key>" downloads a model in the background.
+struct Hs {
+    h: Helper,
+    ready: bool,
+    /// Loaded models on this helper: model key -> device ("cpu"/"cuda").
+    loaded: HashMap<String, String>,
+    loading: Option<String>,
+}
+
+/// A background model download: which engine/language it is for.
+#[derive(Clone)]
+struct Download {
+    engine: String,
+    lang: String,
+    key: String,
+}
+
+/// Audio of the current request: waits for the prebuffer, and is kept whole for the cache.
 struct Pending {
     req: u64,
+    text: String,
     chunks: Vec<(Vec<f32>, u32)>,
     secs: f32,
     playing: bool,
+    all: Vec<f32>,
+    sr: u32,
 }
 
 pub struct App {
@@ -56,14 +105,17 @@ pub struct App {
     rx: Receiver<Event>,
     tx: Tx,
 
-    helper: Option<Helper>,
-    helper_ready: bool,
+    helpers: HashMap<String, Hs>,
+    downloads: HashMap<String, Download>,
+    paused_downloads: HashMap<String, f32>,
+    /// Model download progress (MB) by model key, from any helper.
+    model_dl: HashMap<String, f32>,
+    /// Engine to switch to as soon as its model finishes downloading.
+    switch_to: Option<String>,
     queued: Option<String>,
     current_req: Option<u64>,
     pending: Option<Pending>,
-    loaded: HashMap<String, String>,
-    loading: Option<String>,
-    model_dl: HashMap<String, f32>,
+    cached: HashSet<String>,
 
     player: Player,
     devices: Vec<String>,
@@ -74,10 +126,13 @@ pub struct App {
     text: String,
     history_pos: Option<usize>,
     focus_text: bool,
-    status: String,
+    status: Status,
     error: Option<String>,
     show_all_engines: bool,
     installs: HashMap<String, Install>,
+    paused_installs: HashMap<String, f32>,
+    vmic_step: Option<String>,
+    vmic_msg: Option<(bool, String)>,
     benching: HashMap<String, String>,
     agree_prompt: Option<String>,
     voices: Vec<String>,
@@ -89,6 +144,7 @@ pub struct App {
     hotkey_cur: Option<global_hotkey::hotkey::HotKey>,
     frames: u32,
     win: Option<platform::Window>,
+    prev_window: Option<std::sync::Arc<std::sync::atomic::AtomicIsize>>,
     scroll_to: Option<String>,
 }
 
@@ -97,6 +153,7 @@ impl App {
         let ctx = cc.egui_ctx.clone();
         egui_extras::install_image_loaders(&ctx);
         style(&ctx);
+        i18n::set_lang(&cfg.ui_lang);
         let (s, rx) = unbounded();
         let tx: Tx = (s, ctx.clone());
 
@@ -125,14 +182,15 @@ impl App {
             uv: find_uv(),
             rx,
             tx,
-            helper: None,
-            helper_ready: false,
+            helpers: HashMap::new(),
+            downloads: HashMap::new(),
+            paused_downloads: HashMap::new(),
+            model_dl: HashMap::new(),
+            switch_to: None,
             queued: None,
             current_req: None,
             pending: None,
-            loaded: HashMap::new(),
-            loading: None,
-            model_dl: HashMap::new(),
+            cached: HashSet::new(),
             player,
             devices,
             ptt: Ptt::new(),
@@ -141,10 +199,13 @@ impl App {
             text: String::new(),
             history_pos: None,
             focus_text: true,
-            status: "Ready".into(),
+            status: Status::Ready,
             error: None,
             show_all_engines: false,
             installs: HashMap::new(),
+            paused_installs: HashMap::new(),
+            vmic_step: None,
+            vmic_msg: None,
             benching: HashMap::new(),
             agree_prompt: None,
             voices: config::list_voices(),
@@ -155,6 +216,7 @@ impl App {
             hotkey_cur: None,
             frames: 0,
             win: platform::Window::from(cc),
+            prev_window: None,
             scroll_to: None,
         };
         if app.cfg.voice.as_ref().map(|v| !app.voices.contains(v)).unwrap_or(true) {
@@ -162,10 +224,15 @@ impl App {
         }
         if let Some(w) = app.win {
             w.round_corners();
+            app.prev_window = Some(w.track_previous());
         }
+        if app.cfg.vmic_setup {
+            vmic::restore_on_startup(app.tx.clone());
+        }
+        app.tidy_phrase_cache();
         app.apply_hotkey();
         app.fix_engine_for_language();
-        app.ensure_helper();
+        app.ensure_main();
         if let Ok(t) = std::env::var("CORVOX_SAY") {
             app.speak(t); // debug: speak on startup
         }
@@ -189,12 +256,24 @@ impl App {
         self.catalog.as_ref()?.engine(&self.cfg.engine)
     }
 
+    fn engine_by_id(&self, id: &str) -> Option<Engine> {
+        self.catalog.as_ref()?.engine(id).cloned()
+    }
+
     fn agreed(&self, id: &str) -> bool {
         self.cfg.agreed.iter().any(|a| a == id)
     }
 
     fn busy(&self) -> bool {
         self.current_req.is_some() || self.player.is_playing() || self.pending.is_some()
+    }
+
+    fn model_key_for(&self, e: &Engine) -> String {
+        e.model_key(e.load_language(&self.cfg.language))
+    }
+
+    fn model_ready(&self, e: &Engine) -> bool {
+        engine::is_installed(&e.env) && self.cfg.is_downloaded(&self.model_key_for(e))
     }
 
     fn apply_hotkey(&mut self) {
@@ -205,81 +284,241 @@ impl App {
         match self.cfg.hotkey.parse::<global_hotkey::hotkey::HotKey>() {
             Ok(hk) => match mgr.register(hk) {
                 Ok(()) => self.hotkey_cur = Some(hk),
-                Err(e) => self.error = Some(format!("Couldn't register {}: {e}", self.cfg.hotkey)),
+                Err(e) => self.error = Some(tf("Couldn't register {}: {}", &[&self.cfg.hotkey, &e.to_string()])),
             },
-            Err(e) => self.error = Some(format!("Bad shortcut \"{}\": {e}", self.cfg.hotkey)),
+            Err(e) => self.error = Some(tf("Bad shortcut \"{}\": {}", &[&self.cfg.hotkey, &e.to_string()])),
         }
     }
 
     fn fix_engine_for_language(&mut self) {
-        let Some(cat) = &self.catalog else { return };
+        let Some(cat) = self.catalog.clone() else { return };
         let ok = cat.engine(&self.cfg.engine).map(|e| e.languages.contains(&self.cfg.language)).unwrap_or(false);
         if !ok {
             let list = cat.engines_for(&self.cfg.language);
-            let pick = list.iter().find(|e| engine::is_installed(&e.env)).or(list.first());
+            let pick = list
+                .iter()
+                .find(|e| self.model_ready(e))
+                .or_else(|| list.iter().find(|e| engine::is_installed(&e.env)))
+                .or(list.first());
             if let Some(e) = pick {
                 self.cfg.engine = e.id.clone();
             }
         }
     }
 
-    /// Starts (or swaps) the helper process for the selected engine's environment.
-    fn ensure_helper(&mut self) {
+    fn spawn_helper(&mut self, key: &str, e: &Engine) -> bool {
+        let (Some(uv), Some(dir)) = (self.uv.clone(), self.engines_dir.clone()) else { return false };
+        match Helper::spawn(&uv, &dir, &e.env, key, self.agreed(&e.id), self.cfg.int8, self.tx.clone()) {
+            Ok(h) => {
+                self.helpers.insert(key.to_string(), Hs { h, ready: false, loaded: HashMap::new(), loading: None });
+                true
+            }
+            Err(err) => {
+                self.error = Some(tf("Couldn't start engine: {}", &[&err.to_string()]));
+                false
+            }
+        }
+    }
+
+    /// Makes sure the "main" helper runs the selected engine's environment, then loads its model.
+    fn ensure_main(&mut self) {
         let Some(e) = self.engine().cloned() else { return };
         if !engine::is_installed(&e.env) {
-            self.helper = None;
+            self.helpers.remove(MAIN);
             return;
         }
-        let alive = self.helper.as_mut().map(|h| h.env == e.env && h.is_alive()).unwrap_or(false);
+        let alive = self.helpers.get_mut(MAIN).map(|hs| hs.h.env == e.env && hs.h.is_alive()).unwrap_or(false);
         if alive {
-            if self.helper_ready {
+            if self.helpers.get(MAIN).map(|hs| hs.ready).unwrap_or(false) {
                 self.preload(false);
             }
             return;
         }
-        let (Some(uv), Some(dir)) = (self.uv.clone(), self.engines_dir.clone()) else { return };
-        self.helper = None;
-        self.helper_ready = false;
-        self.loaded.clear();
-        self.loading = None;
-        match Helper::spawn(&uv, &dir, &e.env, self.agreed(&e.id), self.cfg.int8, self.tx.clone()) {
-            Ok(h) => {
-                self.helper = Some(h);
-                self.status = "Starting engine…".into();
-            }
-            Err(err) => self.error = Some(format!("Couldn't start engine: {err}")),
+        self.helpers.remove(MAIN);
+        if self.spawn_helper(MAIN, &e) {
+            self.status = Status::StartingEngine;
         }
     }
 
-    fn restart_helper(&mut self) {
-        self.helper = None;
-        self.helper_ready = false;
-        self.ensure_helper();
+    fn restart_main(&mut self) {
+        self.helpers.remove(MAIN);
+        self.ensure_main();
     }
 
-    /// Loads the selected model (downloading it the first time) and prepares the voice.
+    /// Loads the selected model on the main helper and prepares the voice. Models that aren't
+    /// downloaded yet go to a background download instead, so speaking never blocks on one.
     fn preload(&mut self, force: bool) {
         let Some(e) = self.engine().cloned() else { return };
-        let key = format!("{}:{}", e.id, self.cfg.language);
-        if !force && (self.loaded.contains_key(&key) || self.loading.as_deref() == Some(key.as_str())) {
+        let lang = e.load_language(&self.cfg.language).to_string();
+        let key = e.model_key(&lang);
+        if !self.cfg.is_downloaded(&key) {
+            self.switch_to = Some(e.id.clone());
+            self.start_download(&e);
             return;
         }
         let voice = self.cfg.voice_path();
-        let prefix = format!("{}:", e.id);
-        let others: Vec<String> = self.loaded.keys().filter(|k| !k.starts_with(&prefix)).cloned().collect();
-        if let Some(h) = &mut self.helper {
-            for k in others {
-                if let Some(model) = k.split(':').next() {
-                    h.unload(model);
+        let Some(hs) = self.helpers.get_mut(MAIN) else { return };
+        if !force && (hs.loaded.contains_key(&key) || hs.loading.as_deref() == Some(key.as_str())) {
+            return;
+        }
+        let stale: Vec<String> = hs.loaded.keys().filter(|k| **k != key).cloned().collect();
+        for k in stale {
+            hs.h.unload(k.split(':').next().unwrap_or(&k));
+            hs.loaded.remove(&k);
+        }
+        if hs.h.load(&e.id, &lang, voice.as_deref(), e.model_mb).is_ok() {
+            hs.loading = Some(key);
+            self.status = Status::Loading;
+        }
+    }
+
+    // ---------- background model downloads ----------
+
+    fn start_download(&mut self, e: &Engine) {
+        if !engine::is_installed(&e.env) {
+            return;
+        }
+        let lang = e.load_language(&self.cfg.language).to_string();
+        let key = e.model_key(&lang);
+        let hkey = format!("dl:{key}");
+        if self.helpers.contains_key(&hkey) {
+            return;
+        }
+        self.paused_downloads.remove(&key);
+        if self.spawn_helper(&hkey, e) {
+            self.downloads.insert(hkey, Download { engine: e.id.clone(), lang, key: key.clone() });
+            self.model_dl.entry(key).or_insert(0.0);
+        }
+    }
+
+    fn pause_download(&mut self, key: &str) {
+        let hkey = format!("dl:{key}");
+        self.helpers.remove(&hkey); // killing the helper stops the download; resuming continues it
+        self.downloads.remove(&hkey);
+        let done = self.model_dl.remove(key).unwrap_or(0.0);
+        self.paused_downloads.insert(key.to_string(), done);
+        if self.switch_to.as_deref().and_then(|id| self.engine_by_id(id)).map(|e| self.model_key_for(&e) == key).unwrap_or(false) {
+            self.switch_to = None;
+        }
+    }
+
+    fn finish_download(&mut self, hkey: &str, result: Result<String, String>) {
+        self.helpers.remove(hkey);
+        let Some(dl) = self.downloads.remove(hkey) else { return };
+        self.model_dl.remove(&dl.key);
+        match result {
+            Ok(_) => {
+                self.cfg.mark_downloaded(&dl.key);
+                self.cfg.save();
+                if self.switch_to.as_deref() == Some(dl.engine.as_str()) {
+                    self.switch_to = None;
+                    self.cfg.engine = dl.engine.clone();
+                    if let Some(e) = self.engine_by_id(&dl.engine) {
+                        if e.languages.contains(&dl.lang) {
+                            self.cfg.language = dl.lang.clone();
+                        }
+                    }
+                    self.cfg.save();
+                    self.ensure_main();
                 }
+                self.status = Status::Msg(t("Model downloaded").into());
             }
-            self.loaded.retain(|k, _| k.starts_with(&prefix));
-            if h.load(&e.id, &self.cfg.language, voice.as_deref(), e.model_mb).is_ok() {
-                self.loading = Some(key);
-                self.status = "Loading the model…".into();
+            Err(err) => {
+                self.paused_downloads.insert(dl.key, 0.0);
+                self.error = Some(err);
             }
         }
     }
+
+    /// Picks an engine from its card. If its model isn't downloaded yet, downloads it in the
+    /// background and switches when it's done; the current engine keeps working meanwhile.
+    fn select_engine(&mut self, e: &Engine) {
+        if self.model_ready(e) {
+            self.switch_to = None;
+            self.cfg.engine = e.id.clone();
+            self.cfg.save();
+            self.ensure_main();
+        } else {
+            self.switch_to = Some(e.id.clone());
+            self.start_download(e);
+        }
+    }
+
+    // ---------- phrase audio cache ----------
+
+    fn phrase_key(&self, text: &str) -> Option<String> {
+        let e = self.engine()?;
+        let voice = self.cfg.voice.as_ref()?;
+        let vp = self.cfg.voice_path()?;
+        let stamp = std::fs::metadata(&vp)
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let int8 = e.id.starts_with("pocket") && self.cfg.int8;
+        Some(format!("{:016x}", fnv(&format!("{}|{}|{}|{}|{}|{}", e.id, self.cfg.language, voice, stamp, int8, text.trim()))))
+    }
+
+    fn phrase_path(key: &str) -> PathBuf {
+        config::phrase_cache_dir().join(format!("{key}.wav"))
+    }
+
+    /// Keeps only audio for the phrases still listed (with the current engine and voice).
+    fn tidy_phrase_cache(&mut self) {
+        let keep: HashSet<String> = if self.cfg.keep_phrases {
+            self.phrase_list().iter().filter_map(|p| self.phrase_key(p)).collect()
+        } else {
+            HashSet::new()
+        };
+        self.cached.clear();
+        for entry in std::fs::read_dir(config::phrase_cache_dir()).into_iter().flatten().flatten() {
+            let p = entry.path();
+            let Some(stem) = p.file_stem().and_then(|s| s.to_str()).map(String::from) else { continue };
+            if keep.contains(&stem) {
+                self.cached.insert(stem);
+            } else {
+                let _ = std::fs::remove_file(&p);
+            }
+        }
+    }
+
+    fn forget_phrases(&mut self, removed: &[String]) {
+        for p in removed {
+            if let Some(k) = self.phrase_key(p) {
+                let _ = std::fs::remove_file(Self::phrase_path(&k));
+                self.cached.remove(&k);
+            }
+        }
+    }
+
+    fn play_saved(&mut self, key: &str) -> bool {
+        let Ok(r) = hound::WavReader::open(Self::phrase_path(key)) else {
+            self.cached.remove(key);
+            return false;
+        };
+        let sr = r.spec().sample_rate;
+        let s: Vec<f32> = r.into_samples::<i16>().flatten().map(|x| x as f32 / 32768.0).collect();
+        if s.is_empty() {
+            return false;
+        }
+        self.play_now(vec![(s, sr)]);
+        self.status = Status::SpeakingSaved;
+        true
+    }
+
+    fn save_phrase_audio(&mut self, text: &str, samples: Vec<f32>, sr: u32) {
+        if !self.cfg.keep_phrases || samples.is_empty() || !self.phrase_list().iter().any(|p| p == text) {
+            return;
+        }
+        let Some(key) = self.phrase_key(text) else { return };
+        self.cached.insert(key.clone());
+        std::thread::spawn(move || {
+            let _ = audio::write_wav(&Self::phrase_path(&key), &samples, sr);
+        });
+    }
+
+    // ---------- speaking ----------
 
     fn speak(&mut self, text: String) {
         let text = text.trim().to_string();
@@ -287,45 +526,61 @@ impl App {
             return;
         }
         self.error = None;
-        let Some(voice) = self.cfg.voice_path() else {
-            self.error = Some("Add your voice clip first.".into());
-            self.page = Page::Voices;
-            self.expand(true);
-            return;
-        };
-        let Some(e) = self.engine().cloned() else { return };
-        if !engine::is_installed(&e.env) {
-            self.error = Some(format!("Install {} first.", e.name));
-            self.page = Page::Engines;
-            self.expand(true);
-            return;
-        }
-        self.cfg.push_recent(&text);
+        let removed = self.cfg.push_recent(&text);
+        self.forget_phrases(&removed);
         self.cfg.save();
         if self.busy() {
             self.stop(); // a new line interrupts the old one
         }
-        self.ensure_helper();
-        if !self.helper_ready {
+        if self.cfg.voice_path().is_none() {
+            self.error = Some(t("Add your voice clip first.").into());
+            self.page = Page::Voices;
+            self.expand(true);
+            return;
+        }
+        // Saved audio plays instantly, even while engines are busy or downloading.
+        if self.cfg.keep_phrases {
+            if let Some(key) = self.phrase_key(&text) {
+                if self.cached.contains(&key) && self.play_saved(&key) {
+                    return;
+                }
+            }
+        }
+        let Some(e) = self.engine().cloned() else { return };
+        if !engine::is_installed(&e.env) {
+            self.error = Some(tf("Install {} first.", &[&e.name]));
+            self.page = Page::Engines;
+            self.expand(true);
+            return;
+        }
+        if !self.cfg.is_downloaded(&self.model_key_for(&e)) {
+            self.preload(false);
+            self.error = Some(tf("{} is still downloading. Pick another engine meanwhile.", &[&e.name]));
+            return;
+        }
+        self.ensure_main();
+        let ready = self.helpers.get(MAIN).map(|hs| hs.ready).unwrap_or(false);
+        if !ready {
             self.queued = Some(text);
             return;
         }
-        if let Some(h) = &mut self.helper {
-            match h.speak(&e.id, &text, &voice, &self.cfg.language, e.model_mb) {
-                Ok(id) => {
-                    self.current_req = Some(id);
-                    self.pending = Some(Pending { req: id, chunks: vec![], secs: 0.0, playing: false });
-                    self.status = "Generating…".into();
-                }
-                Err(err) => self.error = Some(format!("Engine error: {err}")),
+        let voice = self.cfg.voice_path().unwrap_or_default();
+        let lang = self.cfg.language.clone();
+        let Some(hs) = self.helpers.get_mut(MAIN) else { return };
+        match hs.h.speak(&e.id, &text, &voice, &lang, e.model_mb) {
+            Ok(id) => {
+                self.current_req = Some(id);
+                self.pending = Some(Pending { req: id, text, chunks: vec![], secs: 0.0, playing: false, all: vec![], sr: 24000 });
+                self.status = Status::Generating;
             }
+            Err(err) => self.error = Some(tf("Engine error: {}", &[&err.to_string()])),
         }
     }
 
     fn stop(&mut self) {
         if self.current_req.is_some() {
-            if let Some(h) = &mut self.helper {
-                h.cancel();
+            if let Some(hs) = self.helpers.get_mut(MAIN) {
+                hs.h.cancel();
             }
         }
         self.current_req = None;
@@ -333,7 +588,7 @@ impl App {
         self.queued = None;
         self.player.stop();
         self.ptt.release();
-        self.status = "Ready".into();
+        self.status = Status::Ready;
     }
 
     fn play_now(&mut self, chunks: Vec<(Vec<f32>, u32)>) {
@@ -344,7 +599,7 @@ impl App {
         for (s, sr) in chunks {
             self.player.push(&s, sr);
         }
-        self.status = "Speaking".into();
+        self.status = Status::Speaking;
     }
 
     fn rebuild_player(&mut self) {
@@ -352,6 +607,8 @@ impl App {
         let mic = self.cfg.output_device.clone().or_else(|| audio::guess_virtual_device(&self.devices));
         self.player = Player::new(mic.as_deref(), self.cfg.monitor, self.cfg.monitor_volume);
     }
+
+    // ---------- window ----------
 
     fn expand(&mut self, expanded: bool) {
         if self.cfg.collapsed == !expanded {
@@ -371,10 +628,40 @@ impl App {
         self.tx.1.send_viewport_cmd(egui::ViewportCommand::WindowLevel(lvl));
     }
 
+    /// The shortcut: brings Corvox up, or, if it already has focus, gives focus back to
+    /// whatever window had it before.
+    fn on_hotkey(&mut self) {
+        let ctx = self.tx.1.clone();
+        let focused = match self.win {
+            Some(w) => w.is_foreground(),
+            None => ctx.input(|i| i.viewport().focused.unwrap_or(false)),
+        };
+        if focused {
+            let prev = self.prev_window.as_ref().and_then(|p| platform::Window::from_raw(p.load(std::sync::atomic::Ordering::Relaxed)));
+            match (self.win, prev) {
+                (Some(own), Some(prev)) if prev != own && prev.exists() => {
+                    prev.focus();
+                }
+                (Some(_), _) => {}
+                (None, _) => ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true)),
+            }
+            return;
+        }
+        ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+        match self.win {
+            Some(w) => {
+                w.focus();
+            }
+            None => ctx.send_viewport_cmd(egui::ViewportCommand::Focus),
+        }
+        self.focus_text = true;
+    }
+
     fn import_voice(&mut self) {
         let Some(src) = rfd::FileDialog::new()
-            .set_title("Pick a clip of your voice")
-            .add_filter("Audio", &["mp3", "wav", "flac", "ogg", "m4a", "aac", "opus", "webm", "mp4"])
+            .set_title(t("Pick a clip of your voice"))
+            .add_filter(t("Audio"), &["mp3", "wav", "flac", "ogg", "m4a", "aac", "opus", "webm", "mp4"])
             .pick_file()
         else {
             return;
@@ -404,82 +691,122 @@ impl App {
 
     fn after_install(&mut self, env: &str) {
         let Some(cat) = self.catalog.clone() else { return };
-        // Select the freshly installed engine if it speaks the current language, then load it
-        // right away so the model download happens now (with progress), not on first use.
-        if let Some(e) = cat.engines_for(&self.cfg.language).into_iter().find(|e| e.env == env) {
-            self.cfg.engine = e.id.clone();
-            self.cfg.save();
-        }
-        if self.engine().map(|e| e.env == env).unwrap_or(false) {
-            self.restart_helper();
+        // Download the freshly installed engine's model in the background. Switch to it only
+        // if the current engine can't speak yet; otherwise just let the user pick it later.
+        let current_usable = self.engine().map(|e| self.model_ready(e)).unwrap_or(false);
+        let candidates: Vec<Engine> = cat.engines.iter().filter(|e| e.env == env).cloned().collect();
+        let pick = candidates.iter().find(|e| e.languages.contains(&self.cfg.language)).or(candidates.first()).cloned();
+        if let Some(e) = pick {
+            if !current_usable {
+                self.switch_to = Some(e.id.clone());
+            }
+            if self.model_ready(&e) {
+                if !current_usable {
+                    self.select_engine(&e);
+                }
+            } else {
+                self.start_download(&e);
+            }
         }
     }
+
+    // ---------- events ----------
 
     fn handle_events(&mut self) {
         while let Ok(ev) = self.rx.try_recv() {
             match ev {
-                Event::HelperReady { env } => {
-                    if self.helper.as_ref().map(|h| h.env == env).unwrap_or(false) {
-                        self.helper_ready = true;
-                        self.status = "Ready".into();
+                Event::HelperReady { key } => {
+                    if let Some(hs) = self.helpers.get_mut(&key) {
+                        hs.ready = true;
+                    }
+                    if key == MAIN {
+                        self.status = Status::Ready;
                         self.preload(false);
                         if let Some(t) = self.queued.take() {
                             self.speak(t);
                         }
+                    } else if let Some(dl) = self.downloads.get(&key).cloned() {
+                        if let (Some(e), Some(hs)) = (self.engine_by_id(&dl.engine), self.helpers.get_mut(&key)) {
+                            let _ = hs.h.load(&e.id, &dl.lang, None, e.model_mb);
+                        }
                     }
                 }
-                Event::HelperExited { env, msg } => {
-                    if self.helper.as_ref().map(|h| h.env == env).unwrap_or(false) {
-                        self.helper = None;
-                        self.helper_ready = false;
-                        self.loaded.clear();
-                        self.loading = None;
-                        self.error = Some(format!("Engine stopped. {msg}"));
-                        self.status = "Ready".into();
+                Event::HelperExited { key, msg } => {
+                    if key == MAIN {
+                        if self.helpers.remove(MAIN).is_some() {
+                            self.error = Some(tf("Engine stopped. {}", &[&msg]));
+                            self.status = Status::Ready;
+                        }
+                    } else if self.downloads.contains_key(&key) {
+                        self.finish_download(&key, Err(tf("Download stopped. {}", &[&msg])));
+                    }
+                }
+                Event::HelperStatus { key, msg } => {
+                    if key == MAIN && self.current_req.is_none() {
+                        self.status = Status::Msg(i18n::engine_status(&msg));
                     }
                 }
                 Event::Status(s) => {
                     if let Some(rest) = s.strip_prefix("voice-ok:") {
                         self.importing = false;
                         let mut it = rest.rsplitn(2, ':');
-                        let secs = it.next().unwrap_or("");
+                        let secs = it.next().unwrap_or("").to_string();
                         let name = it.next().unwrap_or("").to_string();
                         self.voices = config::list_voices();
                         self.cfg.voice = Some(name.clone());
                         self.cfg.save();
                         self.error = None;
-                        self.status = format!("Added \"{name}\" ({secs} s)");
+                        self.status = Status::Msg(tf("Added \"{}\" ({} s)", &[&name, &secs]));
                         self.preload(true);
                     } else if let Some(e) = s.strip_prefix("voice-err:") {
                         self.importing = false;
-                        self.error = Some(format!("Couldn't use that file: {e}"));
-                    } else {
-                        self.status = s;
+                        self.error = Some(tf("Couldn't use that file: {}", &[e]));
                     }
                 }
-                Event::LoadDone { model, result } => {
-                    let key = self.loading.take().unwrap_or_else(|| format!("{model}:{}", self.cfg.language));
-                    self.model_dl.remove(&model);
-                    match result {
-                        Ok(dev) => {
-                            self.loaded.insert(key, dev);
-                            if self.current_req.is_none() {
-                                self.status = "Ready".into();
+                Event::LoadDone { key, result } => {
+                    if key == MAIN {
+                        let Some(hs) = self.helpers.get_mut(MAIN) else { continue };
+                        let mk = hs.loading.take();
+                        match result {
+                            Ok(dev) => {
+                                if let Some(mk) = mk {
+                                    hs.loaded.insert(mk.clone(), dev);
+                                    self.model_dl.remove(&mk);
+                                    self.cfg.mark_downloaded(&mk);
+                                    self.cfg.save();
+                                }
+                                if self.current_req.is_none() {
+                                    self.status = Status::Ready;
+                                }
+                            }
+                            Err(e) => {
+                                if let Some(mk) = mk {
+                                    self.model_dl.remove(&mk);
+                                }
+                                self.error = Some(e);
+                                self.status = Status::Ready;
                             }
                         }
-                        Err(e) => {
-                            self.error = Some(e);
-                            self.status = "Ready".into();
-                        }
+                    } else if self.downloads.contains_key(&key) {
+                        self.finish_download(&key, result);
                     }
                 }
-                Event::ModelProgress { model, done_mb } => {
-                    self.model_dl.insert(model, done_mb);
+                Event::ModelProgress { key, done_mb } => {
+                    let mk = if key == MAIN {
+                        self.helpers.get(MAIN).and_then(|hs| hs.loading.clone())
+                    } else {
+                        self.downloads.get(&key).map(|d| d.key.clone())
+                    };
+                    if let Some(mk) = mk {
+                        self.model_dl.insert(mk, done_mb);
+                    }
                 }
                 Event::Chunk { req, samples, sr } => {
                     let mut flush = None;
                     if let Some(p) = &mut self.pending {
                         if p.req == req {
+                            p.all.extend_from_slice(&samples);
+                            p.sr = sr;
                             if p.playing {
                                 flush = Some(vec![(samples, sr)]);
                             } else {
@@ -500,8 +827,13 @@ impl App {
                     if self.current_req == Some(req) {
                         self.current_req = None;
                         if let Some(p) = self.pending.take() {
-                            if p.req == req && !p.chunks.is_empty() {
-                                self.play_now(p.chunks);
+                            if p.req == req {
+                                if !p.chunks.is_empty() {
+                                    self.play_now(p.chunks);
+                                }
+                                if result.is_ok() {
+                                    self.save_phrase_audio(&p.text, p.all, p.sr);
+                                }
                             }
                         }
                         if let Err(e) = result {
@@ -523,18 +855,20 @@ impl App {
                     }
                 }
                 Event::InstallDone { env, ok, cancelled } => {
-                    let last = self.installs.remove(&env).map(|i| i.line).unwrap_or_default();
+                    let inst = self.installs.remove(&env);
                     if ok {
-                        self.status = "Engine installed".into();
+                        self.paused_installs.remove(&env);
+                        self.status = Status::Msg(t("Engine installed").into());
                         self.after_install(&env);
                     } else if cancelled {
-                        self.status = "Install cancelled".into();
+                        self.paused_installs.insert(env, inst.map(|i| i.mb).unwrap_or(0.0));
                     } else {
-                        self.error = Some(format!("Install failed: {last}"));
+                        self.paused_installs.insert(env, inst.as_ref().map(|i| i.mb).unwrap_or(0.0));
+                        self.error = Some(tf("Install failed: {}", &[&inst.map(|i| i.line).unwrap_or_default()]));
                     }
                 }
                 Event::BenchStatus { model, msg } => {
-                    self.benching.insert(model, msg);
+                    self.benching.insert(model, i18n::engine_status(&msg));
                 }
                 Event::BenchDone { model, result } => {
                     self.benching.remove(&model);
@@ -543,24 +877,37 @@ impl App {
                             self.cfg.bench.insert(model, r);
                             self.cfg.save();
                         }
-                        Err(e) => self.error = Some(format!("Test failed: {e}")),
+                        Err(e) => self.error = Some(tf("Test failed: {}", &[&e])),
                     }
                 }
-                Event::Hotkey => {
-                    let ctx = &self.tx.1;
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
-                    self.focus_text = true;
+                Event::VmicLine(step) => {
+                    self.vmic_step = Some(i18n::vmic_step(&step));
                 }
+                Event::VmicDone { code } => {
+                    self.vmic_step = None;
+                    self.rebuild_player();
+                    self.vmic_msg = Some(match code {
+                        0 if self.player.has_mic() => {
+                            self.cfg.vmic_setup = true;
+                            self.cfg.save();
+                            (true, tf("Virtual mic ready. In Discord: Settings > Voice & Video > Input Device > {}.", &[vmic_discord_name()]))
+                        }
+                        0 => (true, t("Installed. Restart your PC to finish, then open Corvox again.").into()),
+                        2 => (false, t("Cancelled: the Windows permission prompt was declined.").into()),
+                        3 => (false, t("Stopped: the installer isn't signed by VB-Audio. Nothing was installed.").into()),
+                        4 => (false, t("Couldn't download VB-Cable. Check your internet connection.").into()),
+                        c => (false, tf("Setup failed (code {}).", &[&c.to_string()])),
+                    });
+                }
+                Event::Hotkey => self.on_hotkey(),
             }
         }
     }
 
     fn update_ptt(&mut self) {
         let idle = !self.busy();
-        if idle && !self.ptt.is_held() && (self.status == "Speaking" || self.status == "Generating…") {
-            self.status = "Ready".into();
+        if idle && !self.ptt.is_held() && matches!(self.status, Status::Speaking | Status::SpeakingSaved | Status::Generating) {
+            self.status = Status::Ready;
         }
         if !self.ptt.is_held() {
             return;
@@ -572,8 +919,8 @@ impl App {
             if since.elapsed() > Duration::from_millis(250) {
                 self.ptt.release();
                 self.quiet_since = None;
-                if self.status == "Speaking" {
-                    self.status = "Ready".into();
+                if matches!(self.status, Status::Speaking | Status::SpeakingSaved) {
+                    self.status = Status::Ready;
                 }
             }
         }
@@ -592,20 +939,24 @@ impl App {
             icons::small(ui, Icon::Mic, ui.visuals().weak_text_color());
             ui.label(RichText::new(APP_NAME).color(ui.visuals().weak_text_color()));
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                if icons::button(ui, Icon::Close, "Close").clicked() {
+                if icons::button(ui, Icon::Close, t("Close")).clicked() {
                     ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
                 }
                 let on_top = self.cfg.always_on_top;
-                let (icon, tip) = if on_top { (Icon::Pin, "On top of other windows (click to turn off)") } else { (Icon::PinOff, "Keep on top of other windows") };
+                let (icon, tip) = if on_top {
+                    (Icon::Pin, t("On top of other windows (click to turn off)"))
+                } else {
+                    (Icon::PinOff, t("Keep on top of other windows"))
+                };
                 let tint = if on_top { ui.visuals().selection.stroke.color } else { ui.visuals().weak_text_color() };
                 if icons::button_tinted(ui, icon, tint, tip).clicked() {
                     self.set_on_top(!on_top);
                 }
-                if icons::button(ui, Icon::ChevronDown, "Collapse to a bar").clicked() {
+                if icons::button(ui, Icon::ChevronDown, t("Collapse to a bar")).clicked() {
                     self.expand(false);
                 }
                 let st_tint = if self.page == Page::Settings { ui.visuals().selection.stroke.color } else { ui.visuals().widgets.inactive.fg_stroke.color };
-                if icons::button_tinted(ui, Icon::Sliders, st_tint, "Settings").clicked() {
+                if icons::button_tinted(ui, Icon::Sliders, st_tint, t("Settings")).clicked() {
                     self.page = if self.page == Page::Settings { Page::Main } else { Page::Settings };
                 }
             });
@@ -617,7 +968,7 @@ impl App {
         let down = ui.input(|i| i.key_pressed(Key::ArrowDown));
         let resp = ui.add(
             egui::TextEdit::singleline(&mut self.text)
-                .hint_text("Type and press Enter…")
+                .hint_text(t("Type and press Enter…"))
                 .font(FontId::proportional(16.0))
                 .desired_width(width)
                 .margin(Vec2::new(8.0, 7.0)),
@@ -670,30 +1021,35 @@ impl App {
         v
     }
 
-    /// A short status for the current engine, including model download progress.
+    /// Download progress of the selected engine's model, as text, if one is running.
+    fn selected_download(&self) -> Option<String> {
+        let e = self.engine()?;
+        let key = self.switch_to.as_deref().and_then(|id| self.engine_by_id(id)).map(|e| self.model_key_for(&e)).unwrap_or_else(|| self.model_key_for(e));
+        let total = self.switch_to.as_deref().and_then(|id| self.engine_by_id(id)).map(|e| e.model_mb).unwrap_or(e.model_mb);
+        self.model_dl.get(&key).map(|done| pct_or_mb(*done, total))
+    }
+
     fn status_text(&self) -> String {
-        if let Some(e) = self.engine() {
-            if let Some(done) = self.model_dl.get(&e.id) {
-                return format!("Downloading model {}", pct_or_mb(*done, e.model_mb));
-            }
+        if let Some(p) = self.selected_download() {
+            return tf("Downloading model {}", &[&p]);
         }
-        self.status.clone()
+        self.status.text()
     }
 
     fn status_chip(&mut self, ui: &mut egui::Ui) {
         let busy = self.busy();
-        if busy && icons::labeled(ui, Icon::Stop, "Stop").on_hover_text("Stop speaking (Esc)").clicked() {
+        if busy && icons::labeled(ui, Icon::Stop, t("Stop")).on_hover_text(t("Stop speaking (Esc)")).clicked() {
             self.stop();
         }
         let text = self.status_text();
         let col = if self.error.is_some() {
             RED
-        } else if busy || text != "Ready" {
+        } else if busy || self.status != Status::Ready || self.selected_download().is_some() {
             AMBER
         } else {
             GREEN
         };
-        ui.label(RichText::new(truncate(&text, 34)).color(col).small());
+        ui.label(RichText::new(truncate(&text, 30)).color(col).small());
         let (r, _) = ui.allocate_exact_size(Vec2::splat(8.0), Sense::hover());
         ui.painter().circle_filled(r.center(), 3.5, col);
     }
@@ -702,10 +1058,34 @@ impl App {
         if let Some(e) = self.error.clone() {
             ui.horizontal_wrapped(|ui| {
                 ui.label(RichText::new(e).color(RED).small());
-                if icons::button(ui, Icon::Close, "Dismiss").clicked() {
+                if icons::button(ui, Icon::Close, t("Dismiss")).clicked() {
                     self.error = None;
                 }
             });
+        }
+    }
+
+    /// Speaker icon (mute/unmute your own speakers) and their volume.
+    fn volume_control(&mut self, ui: &mut egui::Ui) {
+        ui.spacing_mut().slider_width = 70.0;
+        let mut changed_gain = false;
+        if self.cfg.monitor {
+            let r = ui
+                .add(egui::Slider::new(&mut self.cfg.monitor_volume, 0.0..=1.0).show_value(false))
+                .on_hover_text(t("Volume on your speakers/headphones. Discord always gets full volume."));
+            changed_gain = r.changed();
+            if r.drag_stopped() || (r.changed() && !r.dragged()) {
+                self.cfg.save();
+            }
+        }
+        let (icon, tip) = if self.cfg.monitor { (Icon::Volume, t("Hearing yourself: on (click to mute)")) } else { (Icon::VolumeOff, t("Hearing yourself: off (click to unmute)")) };
+        if icons::button(ui, icon, tip).clicked() {
+            self.cfg.monitor = !self.cfg.monitor;
+            self.cfg.save();
+            self.rebuild_player();
+        }
+        if changed_gain {
+            self.player.set_monitor_gain(self.cfg.monitor_volume);
         }
     }
 
@@ -714,15 +1094,16 @@ impl App {
         self.text_box(ui, w);
         ui.add_space(2.0);
         self.error_line(ui);
-        ui.add_space(4.0);
+        self.vmic_notice(ui);
+        ui.add_space(2.0);
         ui.horizontal(|ui| {
-            ui.label(RichText::new("Recent").small().weak());
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                ui.label(RichText::new("↑↓ to choose · Enter speaks").small().weak());
-            });
+            let label = if self.cfg.keep_phrases { t("Recent") } else { t("Pinned") };
+            ui.label(RichText::new(label).small().weak()).on_hover_text(t("↑↓ to choose · Enter speaks · right-click to edit"));
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| self.volume_control(ui));
         });
 
         let list = self.phrase_list();
+        let keys: Vec<Option<String>> = list.iter().map(|p| self.phrase_key(p)).collect();
         let bottom_h = 38.0;
         let mut speak = None;
         let mut pin = None;
@@ -730,16 +1111,28 @@ impl App {
         let mut edit = None;
         let history_pos = self.history_pos;
         let pinned_list = self.cfg.pinned.clone();
+        let cached = self.cached.clone();
         egui::ScrollArea::vertical().max_height(ui.available_height() - bottom_h).auto_shrink([false, false]).show(ui, |ui| {
             if list.is_empty() {
                 ui.add_space(12.0);
-                ui.label(RichText::new("Phrases you speak show up here. Click one to say it again.").weak());
+                let hint = if self.cfg.keep_phrases {
+                    t("Phrases you speak show up here. Click one to say it again.")
+                } else {
+                    t("Phrase history is off. Pin a phrase to keep it here.")
+                };
+                ui.label(RichText::new(hint).weak());
             }
             for (i, p) in list.iter().enumerate() {
                 let pinned = pinned_list.contains(p);
                 let selected = history_pos == Some(i);
+                let saved = keys[i].as_ref().map(|k| cached.contains(k)).unwrap_or(false);
                 ui.horizontal(|ui| {
-                    if icons::button(ui, Icon::Play, "Speak").clicked() {
+                    let (tint, tip) = if saved {
+                        (ui.visuals().selection.stroke.color, t("Speak (saved audio, plays instantly)"))
+                    } else {
+                        (ui.visuals().widgets.inactive.fg_stroke.color, t("Speak"))
+                    };
+                    if icons::button_tinted(ui, Icon::Play, tint, tip).clicked() {
                         speak = Some(p.clone());
                     }
                     let avail = ui.available_width() - 52.0;
@@ -751,7 +1144,7 @@ impl App {
                             ui.add(label)
                         })
                         .inner
-                        .on_hover_text("Click to speak, right-click to edit");
+                        .on_hover_text(t("Click to speak, right-click to edit"));
                     if r.clicked() {
                         speak = Some(p.clone());
                     }
@@ -759,10 +1152,10 @@ impl App {
                         edit = Some(p.clone());
                     }
                     let tint = if pinned { ui.visuals().selection.stroke.color } else { ui.visuals().weak_text_color() };
-                    if icons::button_tinted(ui, Icon::Pin, tint, if pinned { "Unpin" } else { "Pin" }).clicked() {
+                    if icons::button_tinted(ui, Icon::Pin, tint, if pinned { t("Unpin") } else { t("Pin") }).clicked() {
                         pin = Some(p.clone());
                     }
-                    if !pinned && icons::button_tinted(ui, Icon::Close, ui.visuals().weak_text_color(), "Remove").clicked() {
+                    if !pinned && icons::button_tinted(ui, Icon::Close, ui.visuals().weak_text_color(), t("Remove")).clicked() {
                         remove = Some(p.clone());
                     }
                 });
@@ -774,10 +1167,13 @@ impl App {
         }
         if let Some(p) = pin {
             self.cfg.toggle_pin(&p);
+            let removed = self.cfg.trim_recent();
+            self.forget_phrases(&removed);
             self.cfg.save();
         }
         if let Some(p) = remove {
             self.cfg.recent.retain(|r| *r != p);
+            self.forget_phrases(&[p]);
             self.cfg.save();
         }
         if let Some(p) = speak {
@@ -786,13 +1182,13 @@ impl App {
 
         ui.separator();
         ui.horizontal(|ui| {
-            let voice = self.cfg.voice.clone().unwrap_or_else(|| "Add voice".into());
-            if icons::labeled(ui, Icon::User, &truncate(&voice, 14)).on_hover_text("Voices").clicked() {
+            let voice = self.cfg.voice.clone().unwrap_or_else(|| t("Add voice").into());
+            if icons::labeled(ui, Icon::User, &truncate(&voice, 14)).on_hover_text(t("Voices")).clicked() {
                 self.page = Page::Voices;
             }
             self.language_combo(ui);
-            let ename = self.engine().map(|e| short_name(&e.name)).unwrap_or_else(|| "Engine".into());
-            if icons::labeled(ui, Icon::Cpu, &ename).on_hover_text("Engines and their stats").clicked() {
+            let ename = self.engine().map(|e| short_name(&e.name)).unwrap_or_else(|| t("Engine").into());
+            if icons::labeled(ui, Icon::Cpu, &ename).on_hover_text(t("Engines and their stats")).clicked() {
                 self.page = Page::Engines;
             }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| self.status_chip(ui));
@@ -807,21 +1203,89 @@ impl App {
             .width(56.0)
             .show_ui(ui, |ui| {
                 for code in cat.all_languages() {
-                    ui.selectable_value(&mut self.cfg.language, code.clone(), cat.lang_name(&code));
+                    let name = i18n::lang_name(&code, cat.lang_name(&code));
+                    ui.selectable_value(&mut self.cfg.language, code.clone(), name);
                 }
             })
             .response
-            .on_hover_text("Language");
+            .on_hover_text(t("Speech language"));
         if self.cfg.language != before {
             self.fix_engine_for_language();
             self.cfg.save();
-            self.ensure_helper();
+            self.ensure_main();
+        }
+    }
+
+    fn start_vmic_setup(&mut self, ctx: &egui::Context) {
+        if cfg!(target_os = "macos") {
+            ctx.open_url(egui::OpenUrl::new_tab(vmic::BLACKHOLE_URL));
+            self.vmic_msg = Some((true, t("Install BlackHole 2ch from that page, then click Refresh here.").into()));
+            return;
+        }
+        self.vmic_msg = None;
+        self.vmic_step = Some(t("Starting…").into());
+        vmic::setup(self.tx.clone());
+    }
+
+    /// One line on the main page while there's no virtual mic (or setup is running/finished).
+    fn vmic_notice(&mut self, ui: &mut egui::Ui) {
+        if let Some(step) = self.vmic_step.clone() {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label(RichText::new(step).small());
+            });
+        } else if let Some((ok, msg)) = self.vmic_msg.clone() {
+            ui.horizontal_wrapped(|ui| {
+                ui.label(RichText::new(msg).small().color(if ok { GREEN } else { RED }));
+                if icons::button(ui, Icon::Close, t("Dismiss")).clicked() {
+                    self.vmic_msg = None;
+                }
+            });
+        } else if !self.player.has_mic() {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(t("No virtual mic yet, so Discord can't hear Corvox.")).small().color(GOLD));
+                if ui.small_button(t("Set up")).clicked() {
+                    self.start_vmic_setup(&ui.ctx().clone());
+                }
+            });
+        }
+    }
+
+    /// The fuller explanation and button in Settings.
+    fn vmic_box(&mut self, ui: &mut egui::Ui) {
+        if let Some(step) = self.vmic_step.clone() {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label(RichText::new(step).small());
+            });
+            return;
+        }
+        if let Some((ok, msg)) = self.vmic_msg.clone() {
+            ui.label(RichText::new(msg).small().color(if ok { GREEN } else { RED }));
+        }
+        if self.player.has_mic() {
+            return;
+        }
+        ui.label(
+            RichText::new(if cfg!(windows) {
+                t("Discord needs a microphone to hear Corvox. VB-Cable is a free virtual audio cable from VB-Audio: Corvox plays into it and Discord listens to it. Windows will ask for permission, then click Install Driver in VB-Audio's installer.")
+            } else if cfg!(target_os = "macos") {
+                t("Discord needs a microphone to hear Corvox. BlackHole is a free virtual audio cable: install BlackHole 2ch, and Corvox plays into it while Discord listens to it.")
+            } else {
+                t("Discord needs a microphone to hear Corvox. Corvox can create a virtual mic with PipeWire/PulseAudio, no install needed.")
+            })
+            .small()
+            .color(GOLD),
+        );
+        let label = if cfg!(target_os = "macos") { t("Get BlackHole") } else { t("Set up virtual mic") };
+        if icons::labeled(ui, Icon::Download, label).clicked() {
+            self.start_vmic_setup(&ui.ctx().clone());
         }
     }
 
     fn back_header(&mut self, ui: &mut egui::Ui, title: &str) {
         ui.horizontal(|ui| {
-            if icons::labeled(ui, Icon::Back, "Back").clicked() {
+            if icons::labeled(ui, Icon::Back, t("Back")).clicked() {
                 self.page = Page::Main;
             }
             ui.label(RichText::new(title).strong());
@@ -830,21 +1294,22 @@ impl App {
 
     fn engines_page(&mut self, ui: &mut egui::Ui) {
         let Some(cat) = self.catalog.clone() else {
-            self.back_header(ui, "Engines");
-            ui.label("Couldn't find engines/catalog.json next to the app.");
+            self.back_header(ui, t("Engines"));
+            ui.label(t("Couldn't find engines/catalog.json next to the app."));
             return;
         };
         ui.horizontal(|ui| {
-            if icons::labeled(ui, Icon::Back, "Back").clicked() {
+            if icons::labeled(ui, Icon::Back, t("Back")).clicked() {
                 self.page = Page::Main;
             }
-            ui.label(RichText::new(format!("Engines · {}", cat.lang_name(&self.cfg.language))).strong());
+            let lname = i18n::lang_name(&self.cfg.language, cat.lang_name(&self.cfg.language));
+            ui.label(RichText::new(tf("Engines · {}", &[&lname])).strong());
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                ui.checkbox(&mut self.show_all_engines, "All languages");
+                ui.checkbox(&mut self.show_all_engines, t("All languages"));
             });
         });
         if self.uv.is_none() {
-            ui.label(RichText::new("uv isn't installed, so engines can't be installed. See the README.").color(RED));
+            ui.label(RichText::new(t("uv isn't installed, so engines can't be installed. See the README.")).color(RED));
         }
         self.error_line(ui);
         let list: Vec<Engine> = if self.show_all_engines { cat.engines.clone() } else { cat.engines_for(&self.cfg.language).into_iter().cloned().collect() };
@@ -854,157 +1319,104 @@ impl App {
                 ui.add_space(4.0);
             }
             ui.label(
-                RichText::new("Voice match compares the output to your clip. Clarity is how well Whisper understands it. Speed is seconds of speech per second of work.")
+                RichText::new(t("Voice match compares the output to your clip. Clarity is how well Whisper understands it. Speed is seconds of speech per second of work."))
                     .small()
                     .weak(),
             );
         });
     }
 
+    fn engine_stats(&self, ui: &mut egui::Ui, cat: &Catalog, e: &Engine) {
+        let measured = self.cfg.bench.get(&e.id).cloned();
+        let b = measured.clone().unwrap_or_default();
+        let p = &e.published;
+        let pick = |m: Option<f32>, pb: Option<f32>| if measured.is_some() { m } else { pb };
+        let vm = pick(b.voice_match, p.voice_match);
+        let cl = pick(b.clarity, p.clarity);
+        let sp = pick(b.speed, p.speed);
+        let ram = pick(b.ram_mb, p.ram_mb);
+        let vram = pick(b.vram_mb, p.vram_mb);
+        stat_row(ui, t("Voice match"), vm.map(|v| v / 100.0), vm.map(|v| format!("{v:.0}%")));
+        stat_row(ui, t("Clarity"), cl.map(|v| v / 100.0), cl.map(|v| format!("{v:.0}%")));
+        stat_row(
+            ui,
+            t("Speed"),
+            sp.map(|v| (v / 4.0).min(1.0)),
+            sp.map(|v| if v < 2.0 { tf("{}× real time", &[&format!("{v:.2}")]) } else { tf("{}× real time", &[&format!("{v:.1}")]) }),
+        );
+        if e.is_gpu() {
+            let label = if measured.is_some() && vram.is_none() { t("VRAM (ran on CPU)") } else { "VRAM" };
+            stat_row(ui, label, vram.map(|v| (v / 8192.0).min(1.0)), vram.map(fmt_mb));
+            stat_row(ui, "RAM", ram.map(|v| (v / 16384.0).min(1.0)), ram.map(fmt_mb));
+        } else {
+            stat_row(ui, "RAM", ram.map(|v| (v / 8192.0).min(1.0)), ram.map(fmt_mb));
+        }
+        let src = match &measured {
+            Some(b) => tf(
+                "Measured on your PC · {} · voice \"{}\"{}",
+                &[&i18n::lang_name(&b.language, cat.lang_name(&b.language)), &b.voice, if b.int8 { " · int8" } else { "" }],
+            ),
+            None => tf("Published · {}", &[if e.published.source.is_empty() { t("no numbers yet") } else { &e.published.source }]),
+        };
+        ui.label(RichText::new(src).small().weak());
+    }
+
     fn engine_card(&mut self, ui: &mut egui::Ui, cat: &Catalog, e: &Engine) {
         let installed = engine::is_installed(&e.env);
+        let mkey = self.model_key_for(e);
+        let downloaded = self.cfg.is_downloaded(&mkey);
         let selected = self.cfg.engine == e.id;
+        let waiting = self.switch_to.as_deref() == Some(e.id.as_str());
         let speaks_lang = e.languages.contains(&self.cfg.language);
-        let stroke = if selected { Stroke::new(1.5, ui.visuals().selection.stroke.color) } else { ui.visuals().widgets.noninteractive.bg_stroke };
+        let ui_lang = self.cfg.ui_lang.clone();
+        let stroke = if selected || waiting {
+            Stroke::new(1.5, ui.visuals().selection.stroke.color)
+        } else {
+            ui.visuals().widgets.noninteractive.bg_stroke
+        };
         let card = egui::Frame::new().stroke(stroke).corner_radius(CornerRadius::same(8)).inner_margin(8.0).show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.horizontal(|ui| {
                 let can_select = installed && speaks_lang;
                 let r = ui.add_enabled(can_select, egui::RadioButton::new(selected, RichText::new(&e.name).strong()));
-                if r.clicked() {
-                    self.cfg.engine = e.id.clone();
-                    self.cfg.save();
-                    self.ensure_helper();
+                if r.clicked() && !selected {
+                    self.select_engine(e);
                 }
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    let (txt, col) = if e.is_gpu() { ("GPU", GOLD) } else { ("CPU", GREEN) };
+                    let (txt, col) = if e.is_gpu() { ("GPU", GOLD) } else { (t("CPU"), GREEN) };
                     ui.label(RichText::new(txt).small().color(col).strong());
                 });
             });
-            ui.label(RichText::new(format!("{} · {}", e.by, e.note)).small().weak());
+            ui.label(RichText::new(format!("{} · {}", e.by, e.note_for(&ui_lang))).small().weak());
             if e.requires_hf && !config::has_hf_token() {
                 ui.horizontal_wrapped(|ui| {
-                    ui.label(RichText::new("Needs a free Hugging Face login to clone voices.").small().color(GOLD));
-                    if ui.small_button("Set up").clicked() {
+                    ui.label(RichText::new(t("Needs a free Hugging Face login to clone voices.")).small().color(GOLD));
+                    if ui.small_button(t("Set up")).clicked() {
                         self.page = Page::Settings;
                     }
                 });
             }
 
-            let measured = self.cfg.bench.get(&e.id).cloned();
-            let src = match &measured {
-                Some(b) => format!(
-                    "Measured on your PC · {} · voice \"{}\"{}",
-                    cat.lang_name(&b.language),
-                    b.voice,
-                    if b.int8 { " · int8" } else { "" }
-                ),
-                None => format!("Published · {}", if e.published.source.is_empty() { "no numbers yet" } else { &e.published.source }),
-            };
-            let b = measured.clone().unwrap_or_default();
-            let p = &e.published;
-            let pick = |m: Option<f32>, pb: Option<f32>| if measured.is_some() { m } else { pb };
-            let vm = pick(b.voice_match, p.voice_match);
-            let cl = pick(b.clarity, p.clarity);
-            let sp = pick(b.speed, p.speed);
-            let ram = pick(b.ram_mb, p.ram_mb);
-            let vram = pick(b.vram_mb, p.vram_mb);
-            stat_row(ui, "Voice match", vm.map(|v| v / 100.0), vm.map(|v| format!("{v:.0}%")));
-            stat_row(ui, "Clarity", cl.map(|v| v / 100.0), cl.map(|v| format!("{v:.0}%")));
-            stat_row(ui, "Speed", sp.map(|v| (v / 4.0).min(1.0)), sp.map(|v| if v < 2.0 { format!("{v:.2}× real time") } else { format!("{v:.1}× real time") }));
-            if e.is_gpu() {
-                let label = if measured.is_some() && vram.is_none() { "VRAM (ran on CPU)" } else { "VRAM" };
-                stat_row(ui, label, vram.map(|v| (v / 8192.0).min(1.0)), vram.map(fmt_mb));
-                stat_row(ui, "RAM", ram.map(|v| (v / 16384.0).min(1.0)), ram.map(fmt_mb));
-            } else {
-                stat_row(ui, "RAM", ram.map(|v| (v / 8192.0).min(1.0)), ram.map(fmt_mb));
+            // Stats; dimmed with a short description on top until the engine is set up.
+            let ready = installed && downloaded;
+            let stats = ui.scope(|ui| {
+                if !ready {
+                    ui.multiply_opacity(0.25);
+                }
+                self.engine_stats(ui, cat, e);
+            });
+            if !ready {
+                let rect = stats.response.rect;
+                let bg = ui.visuals().panel_fill.gamma_multiply(0.6);
+                ui.painter().rect_filled(rect, CornerRadius::same(6), bg);
+                ui.put(rect.shrink2(Vec2::new(10.0, 4.0)), egui::Label::new(RichText::new(e.summary_for(&ui_lang)).strong()).wrap());
             }
-            ui.label(RichText::new(src).small().weak());
-            let on_cpu = self.loaded.get(&format!("{}:{}", e.id, self.cfg.language)).map(|d| d == "cpu").unwrap_or(false);
-            if on_cpu && e.is_gpu() {
-                ui.label(RichText::new("No CUDA GPU found, so this engine is running on the CPU.").small().color(GOLD));
+            let on_cpu = self.helpers.get(MAIN).and_then(|hs| hs.loaded.get(&mkey)).map(|d| d == "cpu").unwrap_or(false);
+            if on_cpu && e.is_gpu() && selected {
+                ui.label(RichText::new(t("No CUDA GPU found, so this engine is running on the CPU.")).small().color(GOLD));
             }
 
-            if let Some(inst) = self.installs.get(&e.env) {
-                let frac = (inst.mb / e.env_mb as f32).min(0.99);
-                ui.add_space(2.0);
-                ui.label(RichText::new("Step 1 of 2 · Installing Python packages").small());
-                ui.add(
-                    egui::ProgressBar::new(frac)
-                        .desired_height(12.0)
-                        .text(RichText::new(format!("{} of ~{}", fmt_mb(inst.mb), fmt_mb(e.env_mb as f32))).small()),
-                );
-                let mut cancel = false;
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new(format!("{} · {}", fmt_elapsed(inst.started.elapsed()), truncate(&inst.line, 42))).small().weak());
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        cancel = icons::labeled(ui, Icon::Close, "Cancel").clicked();
-                    });
-                });
-                if cancel {
-                    engine::cancel_install(&inst.handle);
-                }
-                return;
-            }
-            if let Some(done) = self.model_dl.get(&e.id).copied() {
-                let frac = (done / e.model_mb as f32).min(0.99);
-                ui.add_space(2.0);
-                ui.label(RichText::new("Step 2 of 2 · Downloading the model").small());
-                ui.add(
-                    egui::ProgressBar::new(frac)
-                        .desired_height(12.0)
-                        .text(RichText::new(format!("{} of ~{}", fmt_mb(done), fmt_mb(e.model_mb as f32))).small()),
-                );
-                return;
-            }
-            ui.horizontal_wrapped(|ui| {
-                if !installed {
-                    if self.agree_prompt.as_deref() == Some(e.id.as_str()) {
-                        ui.label(RichText::new(&e.license).small());
-                        if ui.button("I agree, install").clicked() {
-                            self.cfg.agreed.push(e.id.clone());
-                            self.cfg.save();
-                            self.agree_prompt = None;
-                            self.start_install(&e.env);
-                        }
-                        if ui.button("Cancel").clicked() {
-                            self.agree_prompt = None;
-                        }
-                    } else {
-                        let r = ui.add_enabled_ui(self.uv.is_some(), |ui| icons::labeled(ui, Icon::Download, "Install")).inner;
-                        if r.clicked() {
-                            if e.requires_agreement && !self.agreed(&e.id) {
-                                self.agree_prompt = Some(e.id.clone());
-                            } else {
-                                self.start_install(&e.env);
-                            }
-                        }
-                    }
-                } else if let Some(msg) = self.benching.get(&e.id) {
-                    ui.spinner();
-                    ui.label(RichText::new(msg).small());
-                } else if speaks_lang {
-                    let can = self.cfg.voice_path().is_some();
-                    let r = ui.add_enabled_ui(can, |ui| icons::labeled(ui, Icon::Gauge, "Test on my PC")).inner;
-                    if r.on_disabled_hover_text("Add a voice clip first").clicked() {
-                        self.start_bench(e);
-                    }
-                }
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    ui.hyperlink_to(RichText::new("info").small(), &e.url);
-                    let size = if installed {
-                        "installed".to_string()
-                    } else {
-                        let shared = cat.engines.iter().any(|o| o.env == e.env && o.id != e.id && engine::is_installed(&o.env));
-                        if shared {
-                            format!("~{} model", fmt_mb(e.model_mb as f32))
-                        } else {
-                            format!("~{} on disk", fmt_mb((e.env_mb + e.model_mb) as f32))
-                        }
-                    };
-                    ui.label(RichText::new(size).small().weak());
-                });
-            });
+            self.engine_actions(ui, cat, e, installed, downloaded, speaks_lang, &mkey, waiting);
         });
         // Bring an engine into view when its install starts.
         if self.installs.contains_key(&e.env) && self.scroll_to.as_deref() == Some(e.env.as_str()) {
@@ -1013,23 +1425,143 @@ impl App {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn engine_actions(&mut self, ui: &mut egui::Ui, cat: &Catalog, e: &Engine, installed: bool, downloaded: bool, speaks_lang: bool, mkey: &str, waiting: bool) {
+        // Step 1: Python packages.
+        if let Some(inst) = self.installs.get(&e.env) {
+            let frac = (inst.mb / e.env_mb as f32).min(0.99);
+            ui.add_space(2.0);
+            ui.label(RichText::new(t("Step 1 of 2 · Installing Python packages")).small());
+            ui.add(egui::ProgressBar::new(frac).desired_height(12.0).text(RichText::new(tf("{} of ~{}", &[&fmt_mb(inst.mb), &fmt_mb(e.env_mb as f32)])).small()));
+            let mut pause = false;
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(format!("{} · {}", fmt_elapsed(inst.started.elapsed()), truncate(&inst.line, 40))).small().weak());
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    pause = icons::labeled(ui, Icon::Pause, t("Pause")).clicked();
+                });
+            });
+            if pause {
+                engine::cancel_install(&inst.handle);
+            }
+            return;
+        }
+        if let Some(mb) = self.paused_installs.get(&e.env).copied() {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(tf("Install paused · {} of ~{}", &[&fmt_mb(mb), &fmt_mb(e.env_mb as f32)])).small().color(GOLD));
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if icons::labeled(ui, Icon::Play, t("Resume")).clicked() {
+                        self.start_install(&e.env);
+                    }
+                });
+            });
+            return;
+        }
+        // Step 2: the model.
+        if installed && !downloaded {
+            if let Some(done) = self.model_dl.get(mkey).copied() {
+                let frac = (done / e.model_mb as f32).min(0.99);
+                ui.add_space(2.0);
+                let label = if waiting { t("Step 2 of 2 · Downloading the model (switches when done)") } else { t("Step 2 of 2 · Downloading the model") };
+                ui.label(RichText::new(label).small());
+                ui.add(egui::ProgressBar::new(frac).desired_height(12.0).text(RichText::new(tf("{} of ~{}", &[&fmt_mb(done), &fmt_mb(e.model_mb as f32)])).small()));
+                let background = self.helpers.contains_key(&format!("dl:{mkey}"));
+                if background {
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new(t("Your current engine keeps working meanwhile.")).small().weak());
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            if icons::labeled(ui, Icon::Pause, t("Pause")).clicked() {
+                                self.pause_download(mkey);
+                            }
+                        });
+                    });
+                }
+                return;
+            }
+            let paused = self.paused_downloads.get(mkey).copied();
+            ui.horizontal(|ui| {
+                let text = match paused {
+                    Some(mb) if mb > 0.0 => tf("Model download paused · {} of ~{}", &[&fmt_mb(mb), &fmt_mb(e.model_mb as f32)]),
+                    Some(_) => t("Model download paused").into(),
+                    None => tf("Installed · model not downloaded yet (~{})", &[&fmt_mb(e.model_mb as f32)]),
+                };
+                ui.label(RichText::new(text).small().color(GOLD));
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    let (icon, label) = if paused.is_some() { (Icon::Play, t("Resume")) } else { (Icon::Download, t("Download")) };
+                    if icons::labeled(ui, icon, label).clicked() {
+                        self.start_download(e);
+                    }
+                });
+            });
+            return;
+        }
+        ui.horizontal_wrapped(|ui| {
+            if !installed {
+                if self.agree_prompt.as_deref() == Some(e.id.as_str()) {
+                    ui.label(RichText::new(&e.license).small());
+                    if ui.button(t("I agree, install")).clicked() {
+                        self.cfg.agreed.push(e.id.clone());
+                        self.cfg.save();
+                        self.agree_prompt = None;
+                        self.start_install(&e.env);
+                    }
+                    if ui.button(t("Cancel")).clicked() {
+                        self.agree_prompt = None;
+                    }
+                } else {
+                    let r = ui.add_enabled_ui(self.uv.is_some(), |ui| icons::labeled(ui, Icon::Download, t("Install"))).inner;
+                    if r.clicked() {
+                        if e.requires_agreement && !self.agreed(&e.id) {
+                            self.agree_prompt = Some(e.id.clone());
+                        } else {
+                            self.start_install(&e.env);
+                        }
+                    }
+                }
+            } else if let Some(msg) = self.benching.get(&e.id) {
+                ui.spinner();
+                ui.label(RichText::new(msg).small());
+            } else if speaks_lang {
+                let can = self.cfg.voice_path().is_some();
+                let r = ui.add_enabled_ui(can, |ui| icons::labeled(ui, Icon::Gauge, t("Test on my PC"))).inner;
+                if r.on_disabled_hover_text(t("Add a voice clip first")).clicked() {
+                    self.start_bench(e);
+                }
+            }
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                ui.hyperlink_to(RichText::new(t("info")).small(), &e.url);
+                let size = if installed {
+                    t("installed").to_string()
+                } else {
+                    let shared = cat.engines.iter().any(|o| o.env == e.env && o.id != e.id && engine::is_installed(&o.env));
+                    if shared {
+                        tf("~{} model", &[&fmt_mb(e.model_mb as f32)])
+                    } else {
+                        tf("~{} on disk", &[&fmt_mb((e.env_mb + e.model_mb) as f32)])
+                    }
+                };
+                ui.label(RichText::new(size).small().weak());
+            });
+        });
+    }
+
     fn start_install(&mut self, env: &str) {
         let (Some(uv), Some(dir)) = (self.uv.clone(), self.engines_dir.clone()) else { return };
         let handle = engine::install(uv, dir, env.to_string(), self.tx.clone());
         self.scroll_to = Some(env.to_string());
-        self.installs.insert(env.to_string(), Install { started: Instant::now(), mb: 0.0, line: "Starting…".into(), handle });
+        let prev = self.paused_installs.remove(env).unwrap_or(0.0);
+        self.installs.insert(env.to_string(), Install { started: Instant::now(), mb: prev, line: t("Starting…").into(), handle });
     }
 
     fn start_bench(&mut self, e: &Engine) {
         let (Some(uv), Some(dir), Some(voice)) = (self.uv.clone(), self.engines_dir.clone(), self.cfg.voice_path()) else { return };
-        self.benching.insert(e.id.clone(), "Starting…".into());
+        self.benching.insert(e.id.clone(), t("Starting…").into());
         engine::bench(uv, dir, e.env.clone(), e.id.clone(), voice, self.cfg.language.clone(), self.agreed(&e.id), self.cfg.int8, self.tx.clone());
     }
 
     fn voices_page(&mut self, ui: &mut egui::Ui) {
-        self.back_header(ui, "Voices");
+        self.back_header(ui, t("Voices"));
         ui.label(
-            RichText::new("Use 10–20 seconds of you talking normally: no music, no background noise. Corvox uses the part that ends at a natural pause.")
+            RichText::new(t("Use 10–20 seconds of you talking normally: no music, no background noise. Corvox uses the part that ends at a natural pause."))
                 .small()
                 .weak(),
         );
@@ -1045,12 +1577,12 @@ impl App {
                     select = Some(v.clone());
                 }
                 let secs = audio::wav_seconds(&config::voices_dir().join(format!("{v}.wav"))).unwrap_or(0.0);
-                ui.label(RichText::new(format!("{secs:.0} s clip")).small().weak());
+                ui.label(RichText::new(tf("{} s clip", &[&format!("{secs:.0}")])).small().weak());
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    if icons::button(ui, Icon::Trash, "Delete").clicked() {
+                    if icons::button(ui, Icon::Trash, t("Delete")).clicked() {
                         delete = Some(v.clone());
                     }
-                    if icons::button(ui, Icon::Play, "Play the clip").clicked() {
+                    if icons::button(ui, Icon::Play, t("Play the clip")).clicked() {
                         play = Some(v.clone());
                     }
                 });
@@ -1059,6 +1591,7 @@ impl App {
         if let Some(v) = select {
             self.cfg.voice = Some(v);
             self.cfg.save();
+            self.tidy_phrase_cache();
             self.preload(true);
         }
         if let Some(v) = play {
@@ -1081,25 +1614,37 @@ impl App {
         ui.horizontal(|ui| {
             if self.importing {
                 ui.spinner();
-                ui.label("Preparing the clip…");
-            } else if icons::labeled(ui, Icon::Plus, "Add voice from a file…").clicked() {
+                ui.label(t("Preparing the clip…"));
+            } else if icons::labeled(ui, Icon::Plus, t("Add voice from a file…")).clicked() {
                 self.import_voice();
             }
         });
     }
 
     fn settings_page(&mut self, ui: &mut egui::Ui) {
-        self.back_header(ui, "Settings");
+        self.back_header(ui, t("Settings"));
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
             ui.add_space(4.0);
-            ui.label(RichText::new("Send the voice to").small().weak());
+            ui.label(RichText::new(t("Interface language")).small().weak());
+            let before = self.cfg.ui_lang.clone();
+            egui::ComboBox::from_id_salt("ui_lang").selected_text(if self.cfg.ui_lang == "tr" { "Türkçe" } else { "English" }).show_ui(ui, |ui| {
+                ui.selectable_value(&mut self.cfg.ui_lang, "en".to_string(), "English");
+                ui.selectable_value(&mut self.cfg.ui_lang, "tr".to_string(), "Türkçe");
+            });
+            if self.cfg.ui_lang != before {
+                i18n::set_lang(&self.cfg.ui_lang);
+                self.cfg.save();
+            }
+
+            ui.add_space(8.0);
+            ui.label(RichText::new(t("Send the voice to")).small().weak());
             let auto = audio::guess_virtual_device(&self.devices);
             let current = self.cfg.output_device.clone();
-            let shown = current.clone().unwrap_or_else(|| format!("Auto ({})", auto.clone().unwrap_or_else(|| "no virtual cable found".into())));
+            let shown = current.clone().unwrap_or_else(|| tf("Auto ({})", &[&auto.clone().unwrap_or_else(|| t("no virtual cable found").into())]));
             let mut changed = false;
             ui.horizontal(|ui| {
                 egui::ComboBox::from_id_salt("dev").selected_text(truncate(&shown, 40)).width(300.0).show_ui(ui, |ui| {
-                    if ui.selectable_label(current.is_none(), "Auto").clicked() {
+                    if ui.selectable_label(current.is_none(), t("Auto")).clicked() {
                         self.cfg.output_device = None;
                         changed = true;
                     }
@@ -1110,31 +1655,13 @@ impl App {
                         }
                     }
                 });
-                if icons::button(ui, Icon::Refresh, "Refresh devices").clicked() {
+                if icons::button(ui, Icon::Refresh, t("Refresh devices")).clicked() {
                     changed = true;
                 }
             });
-            if !self.player.has_mic() {
-                ui.label(
-                    RichText::new(if cfg!(windows) {
-                        "No virtual cable yet. Install VB-Cable, then pick \"CABLE Output\" as your mic in Discord."
-                    } else if cfg!(target_os = "macos") {
-                        "No virtual cable yet. Install BlackHole 2ch, then pick it as your mic in Discord."
-                    } else {
-                        "No virtual cable yet. See the README for the one-line PipeWire/PulseAudio setup."
-                    })
-                    .small()
-                    .color(GOLD),
-                );
-            }
+            self.vmic_box(ui);
             if let Some(e) = &self.player.error {
                 ui.label(RichText::new(e).small().color(RED));
-            }
-            ui.add_space(6.0);
-            changed |= ui.checkbox(&mut self.cfg.monitor, "Also play it on my speakers/headphones").changed();
-            if self.cfg.monitor && ui.add(egui::Slider::new(&mut self.cfg.monitor_volume, 0.0..=1.0).text("volume")).changed() {
-                self.player.set_monitor_gain(self.cfg.monitor_volume);
-                self.cfg.save();
             }
             if changed {
                 self.cfg.save();
@@ -1142,34 +1669,61 @@ impl App {
             }
 
             ui.add_space(8.0);
-            if ui
-                .checkbox(&mut self.cfg.int8, "Faster, lighter Pocket engines (int8)")
-                .on_hover_text("About 10% faster and ~450 MB less RAM. Re-run Test on my PC to compare.")
-                .changed()
-            {
+            ui.label(RichText::new(t("Phrase history")).small().weak());
+            if ui.checkbox(&mut self.cfg.keep_phrases, t("Remember recent phrases and their audio")).changed() {
+                if !self.cfg.keep_phrases {
+                    self.cfg.recent.clear();
+                }
                 self.cfg.save();
-                self.restart_helper();
+                self.tidy_phrase_cache();
+            }
+            if self.cfg.keep_phrases {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(t("Keep the last")).small());
+                    let r = ui.add(egui::DragValue::new(&mut self.cfg.phrase_limit).range(1..=config::MAX_PHRASE_LIMIT));
+                    ui.label(RichText::new(t("phrases")).small());
+                    if r.changed() {
+                        let removed = self.cfg.trim_recent();
+                        self.forget_phrases(&removed);
+                        self.cfg.save();
+                    }
+                });
+                ui.label(
+                    RichText::new(t("Saved audio replays instantly without the engine. Older phrases and their audio are deleted; pinned ones stay. Turning this off clears the list and the saved audio."))
+                        .small()
+                        .weak(),
+                );
             }
 
             ui.add_space(8.0);
-            ui.label(RichText::new("Push-to-talk key (held while speaking)").small().weak());
+            if ui
+                .checkbox(&mut self.cfg.int8, t("Faster, lighter Pocket engines (int8)"))
+                .on_hover_text(t("About 10% faster and ~450 MB less RAM. Re-run Test on my PC to compare."))
+                .changed()
+            {
+                self.cfg.save();
+                self.restart_main();
+            }
+
+            ui.add_space(8.0);
+            ui.label(RichText::new(t("Push-to-talk key (held while speaking)")).small().weak());
             let mut ptt_changed = false;
-            egui::ComboBox::from_id_salt("ptt").selected_text(self.cfg.ptt_key.clone().unwrap_or_else(|| "Off".into())).show_ui(ui, |ui| {
-                ptt_changed |= ui.selectable_value(&mut self.cfg.ptt_key, None, "Off").changed();
+            egui::ComboBox::from_id_salt("ptt").selected_text(self.cfg.ptt_key.clone().unwrap_or_else(|| t("Off").into())).show_ui(ui, |ui| {
+                ptt_changed |= ui.selectable_value(&mut self.cfg.ptt_key, None, t("Off")).changed();
                 for k in ptt::KEYS {
                     ptt_changed |= ui.selectable_value(&mut self.cfg.ptt_key, Some(k.to_string()), k).changed();
                 }
             });
-            ui.label(RichText::new("Set the same key as Push to Talk in Discord. F13–F24 don't clash with anything.").small().weak());
+            ui.label(RichText::new(t("Set the same key as Push to Talk in Discord. F13–F24 don't clash with anything.")).small().weak());
             if ptt_changed {
                 self.cfg.save();
             }
 
             ui.add_space(8.0);
-            ui.label(RichText::new("Shortcut to bring up the window").small().weak());
+            ui.label(RichText::new(t("Shortcut: bring Corvox up, press again to go back")).small().weak());
             ui.horizontal(|ui| {
                 ui.add(egui::TextEdit::singleline(&mut self.hotkey_text).desired_width(180.0));
-                if ui.button("Apply").clicked() {
+                if ui.button(t("Apply")).clicked() {
                     self.cfg.hotkey = self.hotkey_text.trim().to_string();
                     self.cfg.save();
                     self.error = None;
@@ -1179,32 +1733,32 @@ impl App {
             self.error_line(ui);
 
             ui.add_space(8.0);
-            ui.label(RichText::new("Hugging Face login (for Kyutai's Pocket TTS voices)").small().weak());
+            ui.label(RichText::new(t("Hugging Face login (for Kyutai's Pocket TTS voices)")).small().weak());
             if config::has_hf_token() {
                 ui.horizontal(|ui| {
                     icons::small(ui, Icon::Check, GREEN);
-                    ui.label(RichText::new("Token saved").small().color(GREEN));
+                    ui.label(RichText::new(t("Token saved")).small().color(GREEN));
                 });
             }
             ui.horizontal_wrapped(|ui| {
                 ui.label(RichText::new("1.").small());
-                ui.hyperlink_to(RichText::new("Accept the terms on kyutai/pocket-tts").small(), "https://huggingface.co/kyutai/pocket-tts");
+                ui.hyperlink_to(RichText::new(t("Accept the terms on kyutai/pocket-tts")).small(), "https://huggingface.co/kyutai/pocket-tts");
                 ui.label(RichText::new("2.").small());
-                ui.hyperlink_to(RichText::new("Create a read token").small(), "https://huggingface.co/settings/tokens");
+                ui.hyperlink_to(RichText::new(t("Create a read token")).small(), "https://huggingface.co/settings/tokens");
             });
             let mut save = false;
             ui.horizontal(|ui| {
                 ui.add(egui::TextEdit::singleline(&mut self.hf_input).password(true).hint_text("hf_…").desired_width(220.0));
-                save = ui.button("Save token").clicked() && !self.hf_input.trim().is_empty();
+                save = ui.button(t("Save token")).clicked() && !self.hf_input.trim().is_empty();
             });
             if save {
                 self.hf_msg = Some(match config::save_hf_token(&self.hf_input) {
                     Ok(()) => {
                         self.hf_input.clear();
-                        self.restart_helper(); // reload models with the cloning weights
-                        "Saved. Restarting the engine.".into()
+                        self.restart_main(); // reload models with the cloning weights
+                        t("Saved. Restarting the engine.").into()
                     }
-                    Err(e) => format!("Couldn't save: {e}"),
+                    Err(e) => tf("Couldn't save: {}", &[&e.to_string()]),
                 });
             }
             if let Some(m) = &self.hf_msg {
@@ -1212,47 +1766,47 @@ impl App {
             }
 
             ui.add_space(8.0);
-            ui.label(RichText::new("Paths").small().weak());
-            let eng = self.engines_dir.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| "not found".into());
-            let uv = self.uv.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| "not installed".into());
-            ui.label(RichText::new(format!("Engines: {eng}")).small());
+            ui.label(RichText::new(t("Paths")).small().weak());
+            let eng = self.engines_dir.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| t("not found").into());
+            let uv = self.uv.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| t("not installed").into());
+            ui.label(RichText::new(tf("Engines: {}", &[&eng])).small());
             ui.label(RichText::new(format!("uv: {uv}")).small());
-            ui.label(RichText::new(format!("Data: {}", config::data_dir().display())).small());
+            ui.label(RichText::new(tf("Data: {}", &[&config::data_dir().display().to_string()])).small());
         });
     }
 
     fn pill(&mut self, ui: &mut egui::Ui) {
+        // The whole bar drags the window. Registered first, so the text box and buttons drawn
+        // after it still get their clicks.
+        let all = ui.ctx().viewport_rect();
+        let drag = ui.interact(all, ui.scope_id().with("bar-drag"), Sense::click_and_drag());
+        if drag.drag_started() {
+            ui.ctx().send_viewport_cmd(egui::ViewportCommand::StartDrag);
+        }
         ui.horizontal_centered(|ui| {
-            let (r, _) = ui.allocate_exact_size(Vec2::new(20.0, 28.0), Sense::hover());
-            let handle = ui.interact(r, ui.scope_id().with("pill-drag"), Sense::click_and_drag()).on_hover_text("Drag to move");
-            if handle.drag_started() {
-                ui.ctx().send_viewport_cmd(egui::ViewportCommand::StartDrag);
-            }
             let tint = if self.busy() { AMBER } else { ui.visuals().weak_text_color() };
-            ui.put(r, Icon::Mic.image(16.0, tint));
-            let tag = format!("{} · {}", self.cfg.language.to_uppercase(), self.engine().map(|e| short_name(&e.name)).unwrap_or_default());
-            let w = ui.available_width() - 74.0 - tag.chars().count() as f32 * 6.5;
-            self.text_box(ui, w.max(120.0));
+            icons::small(ui, Icon::Mic, tint);
+            let tag = match self.selected_download() {
+                Some(p) => tf("Downloading {}", &[&p]),
+                None => format!("{} · {}", self.cfg.language.to_uppercase(), self.engine().map(|e| short_name(&e.name)).unwrap_or_default()),
+            };
+            let w = ui.available_width() - 70.0 - tag.chars().count() as f32 * 6.2;
+            self.text_box(ui, w.max(110.0));
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 if self.busy() {
-                    if icons::button_tinted(ui, Icon::Stop, AMBER, "Stop (Esc)").clicked() {
+                    if icons::button_tinted(ui, Icon::Stop, AMBER, t("Stop (Esc)")).clicked() {
                         self.stop();
                     }
-                } else if icons::button(ui, Icon::Send, "Speak (Enter)").clicked() {
+                } else if icons::button(ui, Icon::Send, t("Speak (Enter)")).clicked() {
                     let t = std::mem::take(&mut self.text);
                     self.speak(t);
                     self.focus_text = true;
                 }
-                if icons::button(ui, Icon::ChevronUp, "Expand").clicked() {
+                if icons::button(ui, Icon::ChevronUp, t("Expand")).clicked() {
                     self.expand(true);
                 }
                 let col = if self.error.is_some() { RED } else { ui.visuals().weak_text_color() };
-                let dl = self.engine().and_then(|e| self.model_dl.get(&e.id).map(|d| pct_or_mb(*d, e.model_mb)));
-                let label = match dl {
-                    Some(d) => format!("Downloading {d}"),
-                    None => tag,
-                };
-                let r = ui.label(RichText::new(label).small().color(col));
+                let r = ui.label(RichText::new(tag).small().color(col));
                 if let Some(e) = &self.error {
                     r.on_hover_text(e);
                 }
@@ -1264,14 +1818,17 @@ impl App {
     fn debug_screenshot(&mut self, ctx: &egui::Context) {
         let Ok(path) = std::env::var("CORVOX_SHOT") else { return };
         self.frames += 1;
-        let waiting = std::env::var("CORVOX_SAY").is_ok() && (self.busy() || self.queued.is_some() || !self.helper_ready);
+        let main_ready = self.helpers.get(MAIN).map(|h| h.ready).unwrap_or(false);
+        let waiting = std::env::var("CORVOX_SAY").is_ok() && (self.busy() || self.queued.is_some() || !main_ready);
         if waiting && self.frames < 2400 {
             self.frames = self.frames.min(38);
         }
         let wait_frames = std::env::var("CORVOX_SHOT_AFTER").ok().and_then(|s| s.parse::<u32>().ok()).map(|secs| secs * 20).unwrap_or(40);
-        if self.frames < wait_frames {
+        // Request again every 20 frames: a request can be dropped when egui discards a frame
+        // to redo its layout.
+        if self.frames < wait_frames || (self.frames - wait_frames) % 20 != 0 {
             ctx.request_repaint_after(Duration::from_millis(50));
-        } else if self.frames == wait_frames {
+        } else {
             let c = ctx.clone();
             ctx.request_screenshot(move |img| {
                 let [w, h] = img.size;
@@ -1296,22 +1853,23 @@ impl eframe::App for App {
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.debug_screenshot(ui.ctx());
+        let starting = self.helpers.values().any(|h| !h.ready);
         let active = self.busy()
             || !self.installs.is_empty()
             || !self.benching.is_empty()
             || self.ptt.is_held()
             || !self.model_dl.is_empty()
-            || self.loading.is_some();
-        if active || (!self.helper_ready && self.helper.is_some()) {
+            || self.helpers.get(MAIN).map(|h| h.loading.is_some()).unwrap_or(false);
+        if active || starting {
             ui.ctx().request_repaint_after(Duration::from_millis(100));
         }
-        let visuals = ui.visuals().clone();
         let collapsed = self.cfg.collapsed;
+        let visuals = ui.visuals().clone();
         let frame = egui::Frame::new()
             .fill(visuals.panel_fill)
             .stroke(visuals.widgets.noninteractive.bg_stroke)
             .corner_radius(CornerRadius::same(if platform::native_corners() { 0 } else if collapsed { 28 } else { 10 }))
-            .inner_margin(if collapsed { egui::Margin::symmetric(14, 8) } else { egui::Margin::same(10) });
+            .inner_margin(if collapsed { egui::Margin::symmetric(12, 8) } else { egui::Margin::same(10) });
         egui::CentralPanel::default().frame(frame).show(ui, |ui| {
             if collapsed {
                 self.pill(ui);
@@ -1334,7 +1892,7 @@ impl eframe::App for App {
         for i in self.installs.values() {
             engine::cancel_install(&i.handle);
         }
-        self.helper = None;
+        self.helpers.clear();
     }
 }
 
@@ -1366,6 +1924,26 @@ fn stat_row(ui: &mut egui::Ui, label: &str, frac: Option<f32>, text: Option<Stri
         }
         ui.label(RichText::new(text.unwrap_or_else(|| "—".into())).small());
     });
+}
+
+fn vmic_discord_name() -> &'static str {
+    if cfg!(windows) {
+        "CABLE Output"
+    } else if cfg!(target_os = "macos") {
+        "BlackHole 2ch"
+    } else {
+        "Corvox Mic"
+    }
+}
+
+/// Stable 64-bit FNV-1a, used to name saved phrase audio.
+fn fnv(s: &str) -> u64 {
+    let mut h = 0xcbf2_9ce4_8422_2325u64;
+    for b in s.bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
 }
 
 fn fmt_mb(mb: f32) -> String {

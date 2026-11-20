@@ -35,11 +35,47 @@ pub struct Engine {
     pub requires_hf: bool,
     pub url: String,
     pub note: String,
+    #[serde(default)]
+    pub note_tr: String,
+    /// One-line description shown on the card before the engine is installed.
+    #[serde(default)]
+    pub summary: String,
+    #[serde(default)]
+    pub summary_tr: String,
+    /// Kyutai ships one model per language, so "downloaded" is tracked per language.
+    #[serde(default)]
+    pub per_language_models: bool,
 }
 
 impl Engine {
     pub fn is_gpu(&self) -> bool {
         self.device == "gpu"
+    }
+
+    /// Key for "is this model downloaded" bookkeeping.
+    pub fn model_key(&self, lang: &str) -> String {
+        if self.per_language_models {
+            format!("{}:{lang}", self.id)
+        } else {
+            self.id.clone()
+        }
+    }
+
+    /// Language to download for: the current one if the engine speaks it, else its first.
+    pub fn load_language<'a>(&'a self, current: &'a str) -> &'a str {
+        if self.languages.iter().any(|l| l == current) {
+            current
+        } else {
+            self.languages.first().map(|s| s.as_str()).unwrap_or(current)
+        }
+    }
+
+    pub fn note_for(&self, ui_lang: &str) -> &str {
+        if ui_lang == "tr" && !self.note_tr.is_empty() { &self.note_tr } else { &self.note }
+    }
+
+    pub fn summary_for(&self, ui_lang: &str) -> &str {
+        if ui_lang == "tr" && !self.summary_tr.is_empty() { &self.summary_tr } else { &self.summary }
     }
 }
 

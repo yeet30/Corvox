@@ -5,9 +5,11 @@ mod audio;
 mod catalog;
 mod config;
 mod engine;
+mod i18n;
 mod icons;
 mod platform;
 mod ptt;
+mod vmic;
 
 use eframe::egui;
 

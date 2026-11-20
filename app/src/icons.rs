@@ -33,6 +33,9 @@ pub enum Icon {
     Refresh,
     Check,
     Send,
+    Volume,
+    VolumeOff,
+    Pause,
 }
 
 impl Icon {
@@ -56,6 +59,9 @@ impl Icon {
             Icon::Back => ("back", svg!(r#"<path d="M19 12H5M11 18l-6-6 6-6"/>"#)),
             Icon::Refresh => ("refresh", svg!(r#"<path d="M20 12a8 8 0 1 1-2.4-5.7"/><path d="M20 4v5h-5"/>"#)),
             Icon::Check => ("check", svg!(r#"<path d="M5 12l5 5 9-10"/>"#)),
+            Icon::Volume => ("volume", svg!(r#"<path d="M4 9h4l5-4v14l-5-4H4z"/><path d="M16.5 8.5a5 5 0 0 1 0 7M19 6a8.5 8.5 0 0 1 0 12"/>"#)),
+            Icon::VolumeOff => ("volume-off", svg!(r#"<path d="M4 9h4l5-4v14l-5-4H4z"/><path d="M17 9l5 6M22 9l-5 6"/>"#)),
+            Icon::Pause => ("pause", svg!(r#"<rect x="6" y="5" width="4" height="14" rx="1" fill="white"/><rect x="14" y="5" width="4" height="14" rx="1" fill="white"/>"#)),
             Icon::Send => ("send", svg!(r#"<path d="M4 12l16-8-6 16-2.5-6.5z"/>"#)),
         };
         (name, s.as_bytes())

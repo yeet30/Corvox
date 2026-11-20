@@ -7,8 +7,11 @@ Type a line, hear it in **your own voice** in Discord (or any app with a mic set
 
 Corvox copies your voice from a short clip (10–20 seconds, any audio file) and speaks whatever you type into a virtual microphone. Discord just sees a mic. No bot, no Discord tokens, and your text and voice never leave your PC (only the models are downloaded).
 
-- Small native window (Rust + egui), collapses into a one-line bar you can pop up over games with a hotkey
-- Recent and pinned phrases: click one, or use ↑/↓, to say it again
+- Small native window (Rust + egui), collapses into a one-line bar (drag it from anywhere)
+- A global shortcut brings Corvox up; press it again to go back to the window you were in
+- Recent and pinned phrases: click one, or use ↑/↓, to say it again. Their audio is saved, so they replay instantly without the engine (can be turned off, and you choose how many to keep)
+- Engines install and download in the background with Pause/Resume, while the current one keeps working
+- English or Turkish interface
 - Pick a language, then any engine that speaks it. CPU engines work on any PC; GPU engines are optional
 - "Test on my PC" measures each engine with your voice: **voice match**, **clarity**, **speed**, **RAM/VRAM**
 - Can hold your push-to-talk key while it speaks
@@ -31,6 +34,9 @@ Example numbers, Turkish, with a real 20 s phone recording as the voice (Ryzen 7
 |---|---|---|---|---|---|
 | Pocket TTS Turkish (int8) | CPU | 0.99× real time | 1.5 GB RAM | 79% | 95% |
 | XTTS-v2 | GPU | 1.74× real time | 2.0 GB VRAM + 1.8 GB RAM | 85% | 100% |
+| Chatterbox Multilingual | GPU | 0.19× real time | 3.9 GB VRAM + 2.4 GB RAM | 89% | 85% |
+
+Chatterbox is the best voice match but very slow on a laptop RTX 3060: about 26 seconds for 5 seconds of speech.
 
 int8 makes the Pocket engines about 10% faster and saves about 450 MB of RAM at the same quality; it's on by default and can be turned off in Settings.
 
@@ -45,22 +51,24 @@ Engines are installed from inside the app, with a progress bar for each step: Py
 - Windows: `winget install astral-sh.uv`
 - macOS / Linux: `curl -LsSf https://astral.sh/uv/install.sh | sh`
 
-### 2. Install a virtual microphone
+### 2. Virtual microphone
 
-| OS | What to install | Then in Discord, set Input Device to |
+Discord needs a microphone to hear Corvox, so Corvox plays into a *virtual audio cable* and Discord listens to the other end. Click **Set up** (main window) or **Set up virtual mic** (Settings):
+
+| OS | What happens | Then in Discord, set Input Device to |
 |---|---|---|
-| Windows | [VB-Cable](https://vb-audio.com/Cable/) (free) | `CABLE Output` |
-| macOS | [BlackHole 2ch](https://github.com/ExistentialAudio/BlackHole) | `BlackHole 2ch` |
-| Linux (PipeWire/PulseAudio) | nothing, run the commands below | `Corvox Mic` |
+| Windows | Corvox downloads [VB-Cable](https://vb-audio.com/Cable/) (free, by VB-Audio) from vb-audio.com, checks the installer is signed by VB-Audio, and opens it. Approve the Windows prompt and click **Install Driver**. A restart may be needed. | `CABLE Output` |
+| macOS | Opens the [BlackHole](https://existential.audio/blackhole/) download page; install BlackHole 2ch. | `BlackHole 2ch` |
+| Linux (PipeWire/PulseAudio) | Corvox creates the mic itself with `pactl`, no install. | `Corvox Mic` |
 
-Linux:
+Doing it by hand on Linux:
 
 ```bash
 pactl load-module module-null-sink sink_name=corvox sink_properties=device.description=Corvox
 pactl load-module module-remap-source master=corvox.monitor source_name=corvox_mic source_properties=device.description="Corvox Mic"
 ```
 
-Corvox finds the cable automatically. You can change it in Settings.
+Corvox picks the cable automatically. You can change it in Settings.
 
 ### 3. Get Corvox
 
@@ -98,7 +106,8 @@ cargo test                     # audio import tests
 
 Debug switches (environment variables):
 
-- `CORVOX_HOME=<dir>`: use a separate settings and voices folder (engines stay shared)
+- `CORVOX_HOME=<dir>`: use a separate settings, voices and saved-phrase folder
+- `CORVOX_ENVS=<dir>`: use a separate folder for engine environments
 - `CORVOX_ENGINES=<dir>`: where `engines/` is
 - `CORVOX_SAY="text"`: speak this on startup
 - `CORVOX_SHOT=out.png` (+ `CORVOX_SHOT_PAGE=engines|voices|settings`, `CORVOX_SHOT_AFTER=<secs>`): save a screenshot and quit

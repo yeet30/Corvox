@@ -39,8 +39,18 @@ pub struct Config {
     pub bench: HashMap<String, BenchResult>,
     /// Engines whose license the user agreed to (XTTS-v2).
     pub agreed: Vec<String>,
-    /// int8 quantization for the Pocket engines: ~20% faster, about half the RAM.
+    /// The user ran "Set up virtual mic" (Linux recreates its sink on startup).
+    pub vmic_setup: bool,
+    /// int8 quantization for the Pocket engines: ~10% faster, ~450 MB less RAM.
     pub int8: bool,
+    /// UI language: "en" or "tr".
+    pub ui_lang: String,
+    /// Remember recent phrases and keep their audio so they replay instantly.
+    pub keep_phrases: bool,
+    /// How many recent phrases to keep (older ones and their audio are deleted).
+    pub phrase_limit: usize,
+    /// Models already downloaded, as model keys ("xtts", "pocket-tr", "pocket:fr", ...).
+    pub downloaded: Vec<String>,
 }
 
 impl Default for Config {
@@ -60,12 +70,21 @@ impl Default for Config {
             always_on_top: true,
             bench: HashMap::new(),
             agreed: vec![],
+            vmic_setup: false,
             int8: true,
+            ui_lang: if sys_lang_is_turkish() { "tr".into() } else { "en".into() },
+            keep_phrases: true,
+            phrase_limit: 8,
+            downloaded: vec![],
         }
     }
 }
 
-pub const MAX_RECENT: usize = 30;
+pub const MAX_PHRASE_LIMIT: usize = 50;
+
+fn sys_lang_is_turkish() -> bool {
+    ["LANG", "LC_ALL", "LANGUAGE"].iter().any(|k| std::env::var(k).map(|v| v.to_lowercase().starts_with("tr")).unwrap_or(false))
+}
 
 pub fn dirs() -> directories::ProjectDirs {
     directories::ProjectDirs::from("", "", "Corvox").expect("no home directory")
@@ -89,7 +108,8 @@ pub fn voices_dir() -> PathBuf {
 }
 
 pub fn envs_dir() -> PathBuf {
-    let d = data_dir().join("envs");
+    // CORVOX_ENVS moves the engine environments (handy for testing without touching real installs).
+    let d = std::env::var_os("CORVOX_ENVS").map(PathBuf::from).unwrap_or_else(|| data_dir().join("envs"));
     let _ = std::fs::create_dir_all(&d);
     d
 }
@@ -114,14 +134,46 @@ impl Config {
         }
     }
 
-    pub fn push_recent(&mut self, text: &str) {
+    /// Adds a phrase to the top of the recent list and returns the phrases that fell off the end.
+    pub fn push_recent(&mut self, text: &str) -> Vec<String> {
         let text = text.trim();
-        if text.is_empty() {
-            return;
+        if text.is_empty() || !self.keep_phrases {
+            return vec![];
         }
         self.recent.retain(|t| t != text);
         self.recent.insert(0, text.to_string());
-        self.recent.truncate(MAX_RECENT);
+        self.trim_recent()
+    }
+
+    /// Applies `phrase_limit`, returning what was removed. Pinned phrases don't count toward it.
+    pub fn trim_recent(&mut self) -> Vec<String> {
+        let limit = self.phrase_limit.clamp(1, MAX_PHRASE_LIMIT);
+        let pinned = self.pinned.clone();
+        let mut kept = 0;
+        let mut removed = vec![];
+        self.recent.retain(|t| {
+            if pinned.contains(t) {
+                return true;
+            }
+            kept += 1;
+            if kept <= limit {
+                true
+            } else {
+                removed.push(t.clone());
+                false
+            }
+        });
+        removed
+    }
+
+    pub fn is_downloaded(&self, key: &str) -> bool {
+        self.downloaded.iter().any(|d| d == key)
+    }
+
+    pub fn mark_downloaded(&mut self, key: &str) {
+        if !self.is_downloaded(key) {
+            self.downloaded.push(key.to_string());
+        }
     }
 
     pub fn toggle_pin(&mut self, text: &str) {
@@ -137,6 +189,13 @@ impl Config {
         let p = voices_dir().join(format!("{v}.wav"));
         p.exists().then_some(p)
     }
+}
+
+/// Where replayable audio of recent phrases is kept.
+pub fn phrase_cache_dir() -> PathBuf {
+    let d = home_override().unwrap_or_else(data_dir).join("phrase-audio");
+    let _ = std::fs::create_dir_all(&d);
+    d
 }
 
 pub fn list_voices() -> Vec<String> {
