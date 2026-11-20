@@ -1,0 +1,332 @@
+//! Audio: importing voice clips, resampling, and playing speech to the virtual mic.
+
+use std::collections::VecDeque;
+use std::path::Path;
+use std::sync::{Arc, Mutex};
+
+use anyhow::{anyhow, Context, Result};
+use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use cpal::{FromSample, SizedSample};
+
+pub const VOICE_SR: u32 = 24_000;
+const MAX_CLIP_SECONDS: f32 = 20.0;
+
+// ---------- decoding and preparing a voice clip ----------
+
+/// Decodes any common audio file (mp3, wav, flac, ogg, m4a…) to mono f32.
+pub fn decode_to_mono(path: &Path) -> Result<(Vec<f32>, u32)> {
+    use symphonia::core::codecs::audio::AudioDecoderOptions;
+    use symphonia::core::errors::Error;
+    use symphonia::core::formats::probe::Hint;
+    use symphonia::core::formats::{FormatOptions, TrackType};
+    use symphonia::core::io::MediaSourceStream;
+    use symphonia::core::meta::MetadataOptions;
+
+    let file = Box::new(std::fs::File::open(path).with_context(|| format!("can't open {}", path.display()))?);
+    let mss = MediaSourceStream::new(file, Default::default());
+    let mut hint = Hint::new();
+    if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+        hint.with_extension(ext);
+    }
+    let mut format = symphonia::default::get_probe()
+        .probe(&hint, mss, FormatOptions::default(), MetadataOptions::default())
+        .map_err(|e| anyhow!("unsupported audio file: {e}"))?;
+    let track = format.default_track(TrackType::Audio).ok_or_else(|| anyhow!("no audio track"))?;
+    let params = track.codec_params.as_ref().and_then(|p| p.audio()).ok_or_else(|| anyhow!("no audio codec"))?;
+    let mut decoder = symphonia::default::get_codecs()
+        .make_audio_decoder(params, &AudioDecoderOptions::default())
+        .map_err(|e| anyhow!("unsupported codec: {e}"))?;
+    let track_id = track.id;
+
+    let mut mono = Vec::new();
+    let mut rate = 0u32;
+    let mut buf: Vec<f32> = Vec::new();
+    loop {
+        let packet = match format.next_packet() {
+            Ok(Some(p)) => p,
+            Ok(None) => break,
+            Err(Error::IoError(_)) => break,
+            Err(e) => return Err(anyhow!("read error: {e}")),
+        };
+        if packet.track_id != track_id {
+            continue;
+        }
+        match decoder.decode(&packet) {
+            Ok(ab) => {
+                rate = ab.spec().rate();
+                let ch = ab.spec().channels().count().max(1);
+                buf.resize(ab.samples_interleaved(), 0.0);
+                ab.copy_to_slice_interleaved(&mut buf);
+                mono.extend(buf.chunks(ch).map(|f| f.iter().sum::<f32>() / ch as f32));
+                if mono.len() as f32 > rate as f32 * 120.0 {
+                    break; // plenty; we only keep ~20 s anyway
+                }
+            }
+            Err(Error::DecodeError(_)) => continue,
+            Err(e) => return Err(anyhow!("decode error: {e}")),
+        }
+    }
+    if mono.is_empty() || rate == 0 {
+        return Err(anyhow!("the file has no audio"));
+    }
+    Ok((mono, rate))
+}
+
+/// Windowed-sinc resampler. Fine for short clips; band-limits when downsampling.
+pub fn resample(input: &[f32], from: u32, to: u32) -> Vec<f32> {
+    if from == to || input.is_empty() {
+        return input.to_vec();
+    }
+    let ratio = to as f64 / from as f64;
+    let cutoff = ratio.min(1.0) * 0.95;
+    let half = 16.0 / cutoff.min(1.0);
+    let out_len = (input.len() as f64 * ratio).round() as usize;
+    let mut out = Vec::with_capacity(out_len);
+    for n in 0..out_len {
+        let center = n as f64 / ratio;
+        let lo = (center - half).ceil().max(0.0) as usize;
+        let hi = ((center + half).floor() as usize).min(input.len() - 1);
+        let (mut acc, mut wsum) = (0.0f64, 0.0f64);
+        for (i, &s) in input.iter().enumerate().take(hi + 1).skip(lo) {
+            let x = i as f64 - center;
+            let sinc = if x.abs() < 1e-9 { 1.0 } else { (std::f64::consts::PI * x * cutoff).sin() / (std::f64::consts::PI * x * cutoff) };
+            let w = 0.5 + 0.5 * (std::f64::consts::PI * x / half).cos(); // Hann window
+            let k = sinc * w;
+            acc += s as f64 * k;
+            wsum += k;
+        }
+        out.push(if wsum.abs() > 1e-9 { (acc / wsum) as f32 } else { 0.0 });
+    }
+    out
+}
+
+/// Cuts leading/trailing silence, caps the length, and normalizes the peak to -1 dBFS.
+pub fn tidy_clip(samples: &[f32], sr: u32) -> Vec<f32> {
+    let win = (sr / 50) as usize; // 20 ms
+    let rms: Vec<f32> = samples.chunks(win).map(|c| (c.iter().map(|s| s * s).sum::<f32>() / c.len() as f32).sqrt()).collect();
+    let peak_rms = rms.iter().cloned().fold(0.0, f32::max);
+    let thresh = peak_rms * 0.05;
+    let first = rms.iter().position(|&r| r > thresh).unwrap_or(0);
+    let last = rms.iter().rposition(|&r| r > thresh).unwrap_or(rms.len().saturating_sub(1));
+    let pad = 5; // keep 100 ms around the speech
+    let start = first.saturating_sub(pad) * win;
+    let end = ((last + 1 + pad) * win).min(samples.len());
+    let mut clip: Vec<f32> = samples[start..end.max(start)].to_vec();
+    clip.truncate((MAX_CLIP_SECONDS * sr as f32) as usize);
+    let peak = clip.iter().fold(0.0f32, |m, s| m.max(s.abs()));
+    if peak > 1e-4 {
+        let g = 0.89 / peak;
+        clip.iter_mut().for_each(|s| *s *= g);
+    }
+    clip
+}
+
+pub fn write_wav(path: &Path, samples: &[f32], sr: u32) -> Result<()> {
+    let spec = hound::WavSpec { channels: 1, sample_rate: sr, bits_per_sample: 16, sample_format: hound::SampleFormat::Int };
+    let mut w = hound::WavWriter::create(path, spec)?;
+    for &s in samples {
+        w.write_sample((s.clamp(-1.0, 1.0) * 32767.0) as i16)?;
+    }
+    w.finalize()?;
+    Ok(())
+}
+
+/// Turns any audio file into a clean 24 kHz mono WAV voice reference. Returns its length in seconds.
+pub fn import_voice(src: &Path, dest: &Path) -> Result<f32> {
+    let (mono, sr) = decode_to_mono(src)?;
+    let clip = tidy_clip(&resample(&mono, sr, VOICE_SR), VOICE_SR);
+    let secs = clip.len() as f32 / VOICE_SR as f32;
+    if secs < 2.0 {
+        return Err(anyhow!("the clip has less than 2 seconds of speech"));
+    }
+    write_wav(dest, &clip, VOICE_SR)?;
+    Ok(secs)
+}
+
+pub fn wav_seconds(path: &Path) -> Option<f32> {
+    let r = hound::WavReader::open(path).ok()?;
+    Some(r.duration() as f32 / r.spec().sample_rate as f32)
+}
+
+// ---------- output devices ----------
+
+pub fn output_device_names() -> Vec<String> {
+    let host = cpal::default_host();
+    host.output_devices()
+        .map(|it| it.filter_map(|d| d.description().ok().map(|x| x.name().to_string())).collect())
+        .unwrap_or_default()
+}
+
+/// Picks the virtual cable automatically if the user hasn't chosen one.
+pub fn guess_virtual_device(names: &[String]) -> Option<String> {
+    const HINTS: [&str; 6] = ["cable input", "vb-audio", "blackhole", "corvox", "virtual", "loopback"];
+    HINTS.iter().find_map(|h| names.iter().find(|n| n.to_lowercase().contains(h)).cloned())
+}
+
+fn find_device(name: &str) -> Option<cpal::Device> {
+    let host = cpal::default_host();
+    host.output_devices().ok()?.find(|d| d.description().map(|x| x.name() == name).unwrap_or(false))
+}
+
+fn default_device_name() -> Option<String> {
+    cpal::default_host().default_output_device()?.description().ok().map(|d| d.name().to_string())
+}
+
+/// One running output stream fed from a queue of mono samples at the device rate.
+struct Sink {
+    _stream: cpal::Stream,
+    queue: Arc<Mutex<VecDeque<f32>>>,
+    rate: u32,
+    gain: Arc<Mutex<f32>>,
+}
+
+impl Sink {
+    fn open(device: &cpal::Device, gain: f32) -> Result<Self> {
+        let cfg = device.default_output_config()?;
+        let rate = cfg.sample_rate();
+        let channels = cfg.channels() as usize;
+        let queue = Arc::new(Mutex::new(VecDeque::<f32>::new()));
+        let gain = Arc::new(Mutex::new(gain));
+        let stream = match cfg.sample_format() {
+            cpal::SampleFormat::F32 => build::<f32>(device, cfg.into(), channels, queue.clone(), gain.clone())?,
+            cpal::SampleFormat::I16 => build::<i16>(device, cfg.into(), channels, queue.clone(), gain.clone())?,
+            cpal::SampleFormat::U16 => build::<u16>(device, cfg.into(), channels, queue.clone(), gain.clone())?,
+            cpal::SampleFormat::I32 => build::<i32>(device, cfg.into(), channels, queue.clone(), gain.clone())?,
+            f => return Err(anyhow!("unsupported sample format {f}")),
+        };
+        stream.play()?;
+        Ok(Self { _stream: stream, queue, rate, gain })
+    }
+}
+
+fn build<T: SizedSample + FromSample<f32>>(
+    device: &cpal::Device,
+    config: cpal::StreamConfig,
+    channels: usize,
+    queue: Arc<Mutex<VecDeque<f32>>>,
+    gain: Arc<Mutex<f32>>,
+) -> Result<cpal::Stream> {
+    let stream = device.build_output_stream(
+        config,
+        move |data: &mut [T], _| {
+            let g = *gain.lock().unwrap();
+            let mut q = queue.lock().unwrap();
+            for frame in data.chunks_mut(channels) {
+                let v = q.pop_front().unwrap_or(0.0) * g;
+                for s in frame.iter_mut() {
+                    *s = T::from_sample(v);
+                }
+            }
+        },
+        |e| eprintln!("audio stream error: {e}"),
+        None,
+    )?;
+    Ok(stream)
+}
+
+/// Plays speech to the "mic" device (the virtual cable) and optionally to your speakers.
+pub struct Player {
+    mic: Option<Sink>,
+    monitor: Option<Sink>,
+    pub error: Option<String>,
+}
+
+impl Player {
+    pub fn new(mic_device: Option<&str>, monitor: bool, monitor_gain: f32) -> Self {
+        let mut error = None;
+        let mic = match mic_device {
+            Some(name) => match find_device(name).ok_or_else(|| anyhow!("device \"{name}\" not found")).and_then(|d| Sink::open(&d, 1.0)) {
+                Ok(s) => Some(s),
+                Err(e) => {
+                    error = Some(format!("Mic output: {e}"));
+                    None
+                }
+            },
+            None => None,
+        };
+        let default = default_device_name();
+        let monitor = if monitor && default.as_deref() != mic_device {
+            cpal::default_host().default_output_device().and_then(|d| Sink::open(&d, monitor_gain).ok())
+        } else {
+            None
+        };
+        Self { mic, monitor, error }
+    }
+
+    pub fn has_mic(&self) -> bool {
+        self.mic.is_some()
+    }
+
+    pub fn set_monitor_gain(&self, g: f32) {
+        if let Some(m) = &self.monitor {
+            *m.gain.lock().unwrap() = g;
+        }
+    }
+
+    fn sinks(&self) -> impl Iterator<Item = &Sink> {
+        self.mic.iter().chain(self.monitor.iter())
+    }
+
+    pub fn push(&self, samples: &[f32], sr: u32) {
+        for s in self.sinks() {
+            let r = resample(samples, sr, s.rate);
+            s.queue.lock().unwrap().extend(r);
+        }
+    }
+
+    pub fn push_silence(&self, seconds: f32) {
+        for s in self.sinks() {
+            let n = (seconds * s.rate as f32) as usize;
+            s.queue.lock().unwrap().extend(std::iter::repeat_n(0.0, n));
+        }
+    }
+
+    pub fn is_playing(&self) -> bool {
+        self.sinks().any(|s| !s.queue.lock().unwrap().is_empty())
+    }
+
+    pub fn stop(&self) {
+        for s in self.sinks() {
+            s.queue.lock().unwrap().clear();
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn import_stereo_44k_wav_becomes_clean_24k_mono() {
+        let dir = std::env::temp_dir().join(format!("corvox-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("in.wav");
+        let spec = hound::WavSpec { channels: 2, sample_rate: 44_100, bits_per_sample: 16, sample_format: hound::SampleFormat::Int };
+        let mut w = hound::WavWriter::create(&src, spec).unwrap();
+        // 1 s silence, 5 s of a 220 Hz tone, 1 s silence
+        for i in 0..(44_100 * 7) {
+            let t = i as f32 / 44_100.0;
+            let v = if (1.0..6.0).contains(&t) { (t * 220.0 * std::f32::consts::TAU).sin() * 0.3 } else { 0.0 };
+            w.write_sample((v * 32767.0) as i16).unwrap();
+            w.write_sample((v * 32767.0) as i16).unwrap();
+        }
+        w.finalize().unwrap();
+
+        let dest = dir.join("out.wav");
+        let secs = import_voice(&src, &dest).unwrap();
+        assert!((5.0..5.4).contains(&secs), "silence should be trimmed, got {secs}");
+        let r = hound::WavReader::open(&dest).unwrap();
+        assert_eq!(r.spec().sample_rate, VOICE_SR);
+        assert_eq!(r.spec().channels, 1);
+        let peak = r.into_samples::<i16>().flatten().map(|s| (s as i32).abs()).max().unwrap();
+        assert!(peak > 28_000, "peak should be normalized to about -1 dBFS, got {peak}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn resample_keeps_length_ratio() {
+        let x: Vec<f32> = (0..48_000).map(|i| (i as f32 * 0.01).sin()).collect();
+        assert_eq!(resample(&x, 48_000, 24_000).len(), 24_000);
+        assert_eq!(resample(&x, 48_000, 44_100).len(), 44_100);
+    }
+}

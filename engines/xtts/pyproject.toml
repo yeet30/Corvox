@@ -1,0 +1,23 @@
+# Environment for XTTS-v2 (coqui-tts). Uses CUDA PyTorch on Windows/Linux, falls back to CPU.
+[project]
+name = "corvox-env-xtts"
+version = "0.1.0"
+requires-python = ">=3.10,<3.13"
+# torch 2.9+ needs torchcodec + FFmpeg for audio IO; 2.8 still does it itself.
+dependencies = ["corvox-engine", "coqui-tts>=0.24", "torch>=2.6,<2.9", "torchaudio>=2.6,<2.9", "six"]
+
+[project.optional-dependencies]
+bench = ["corvox-engine[bench]"]
+
+[tool.uv]
+package = false
+
+[tool.uv.sources]
+corvox-engine = { path = "../core", editable = true }
+torch = [{ index = "pytorch-cuda", marker = "sys_platform != 'darwin'" }]
+torchaudio = [{ index = "pytorch-cuda", marker = "sys_platform != 'darwin'" }]
+
+[[tool.uv.index]]
+name = "pytorch-cuda"
+url = "https://download.pytorch.org/whl/cu126"
+explicit = true

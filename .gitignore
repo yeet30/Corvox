@@ -1,0 +1,7 @@
+/app/target/
+.venv/
+__pycache__/
+*.pyc
+*.wav
+!engines/**/test-assets/*.wav
+.DS_Store

@@ -1,0 +1,21 @@
+# Environment for Kyutai Pocket TTS and the community Turkish Pocket TTS model. CPU only.
+[project]
+name = "corvox-env-pocket"
+version = "0.1.0"
+requires-python = ">=3.10,<3.14"
+dependencies = ["corvox-engine", "pocket-tts", "torch"]
+
+[project.optional-dependencies]
+bench = ["corvox-engine[bench]"]
+
+[tool.uv]
+package = false
+
+[tool.uv.sources]
+corvox-engine = { path = "../core", editable = true }
+torch = [{ index = "pytorch-cpu", marker = "sys_platform != 'darwin'" }]
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true

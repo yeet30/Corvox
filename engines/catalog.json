@@ -1,0 +1,175 @@
+{
+  "languages": {
+    "tr": "Turkish",
+    "en": "English",
+    "fr": "French",
+    "de": "German",
+    "es": "Spanish",
+    "it": "Italian",
+    "pt": "Portuguese",
+    "nl": "Dutch",
+    "pl": "Polish",
+    "ru": "Russian",
+    "cs": "Czech",
+    "ar": "Arabic",
+    "zh": "Chinese",
+    "hu": "Hungarian",
+    "ko": "Korean",
+    "ja": "Japanese",
+    "hi": "Hindi",
+    "da": "Danish",
+    "el": "Greek",
+    "fi": "Finnish",
+    "he": "Hebrew",
+    "ms": "Malay",
+    "no": "Norwegian",
+    "sv": "Swedish",
+    "sw": "Swahili"
+  },
+  "engines": [
+    {
+      "id": "pocket",
+      "name": "Pocket TTS",
+      "by": "Kyutai",
+      "env": "pocket",
+      "device": "cpu",
+      "languages": [
+        "en",
+        "fr",
+        "de",
+        "pt",
+        "it",
+        "es",
+        "nl"
+      ],
+      "published": {
+        "speed": 2.4,
+        "source": "Kyutai README, 4-vCPU cloud VM"
+      },
+      "license": "MIT code; see the model page for weights",
+      "url": "https://github.com/kyutai-labs/pocket-tts",
+      "note": "Small and fast. Made for CPUs.",
+      "requires_hf": true,
+      "env_mb": 930,
+      "model_mb": 420
+    },
+    {
+      "id": "pocket-large",
+      "name": "Pocket TTS Large",
+      "by": "Kyutai",
+      "env": "pocket",
+      "device": "cpu",
+      "languages": [
+        "en",
+        "fr",
+        "de",
+        "pt",
+        "it",
+        "es",
+        "nl"
+      ],
+      "published": {
+        "source": "No published numbers for the 24-layer models"
+      },
+      "license": "MIT code; see the model page for weights",
+      "requires_hf": true,
+      "url": "https://github.com/kyutai-labs/pocket-tts",
+      "note": "24-layer version: slower, usually more natural.",
+      "env_mb": 930,
+      "model_mb": 1200
+    },
+    {
+      "id": "pocket-tr",
+      "name": "Pocket TTS Turkish",
+      "by": "kaanhgunay (community)",
+      "env": "pocket",
+      "device": "cpu",
+      "languages": [
+        "tr"
+      ],
+      "published": {
+        "source": "No published speed or quality numbers yet"
+      },
+      "license": "CC BY 4.0",
+      "url": "https://huggingface.co/kaanhgunay/pocket-tts-tr",
+      "note": "Version 0.1. 3x bigger than Pocket TTS. English words get Turkish pronunciation.",
+      "env_mb": 930,
+      "model_mb": 1200
+    },
+    {
+      "id": "xtts",
+      "name": "XTTS-v2",
+      "by": "Coqui (community-maintained)",
+      "env": "xtts",
+      "device": "gpu",
+      "languages": [
+        "en",
+        "es",
+        "fr",
+        "de",
+        "it",
+        "pt",
+        "pl",
+        "tr",
+        "ru",
+        "nl",
+        "cs",
+        "ar",
+        "zh",
+        "hu",
+        "ko",
+        "ja",
+        "hi"
+      ],
+      "published": {
+        "source": "No comparable published numbers"
+      },
+      "license": "Coqui Public Model License: non-commercial use only",
+      "requires_agreement": true,
+      "url": "https://github.com/idiap/coqui-ai-TTS",
+      "note": "Good voice match. Slow without an NVIDIA GPU.",
+      "env_mb": 7100,
+      "model_mb": 1900
+    },
+    {
+      "id": "chatterbox",
+      "name": "Chatterbox Multilingual",
+      "by": "Resemble AI",
+      "env": "chatterbox",
+      "device": "gpu",
+      "languages": [
+        "ar",
+        "da",
+        "de",
+        "el",
+        "en",
+        "es",
+        "fi",
+        "fr",
+        "he",
+        "hi",
+        "it",
+        "ja",
+        "ko",
+        "ms",
+        "nl",
+        "no",
+        "pl",
+        "pt",
+        "ru",
+        "sv",
+        "sw",
+        "tr",
+        "zh"
+      ],
+      "published": {
+        "source": "No comparable published numbers"
+      },
+      "license": "MIT",
+      "url": "https://github.com/resemble-ai/chatterbox",
+      "note": "Expressive and accurate. Wants an NVIDIA GPU.",
+      "env_mb": 6500,
+      "model_mb": 3200
+    }
+  ]
+}
