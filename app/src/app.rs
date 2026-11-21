@@ -21,7 +21,6 @@ pub const COLLAPSED: Vec2 = Vec2::new(440.0, 56.0);
 
 /// Streamed audio is held back until this much is ready, so slow CPUs don't stutter mid-word.
 const PREBUFFER_SECS: f32 = 0.4;
-const MAIN: &str = "main";
 
 const RED: Color32 = Color32::from_rgb(0xE2, 0x4B, 0x4A);
 const AMBER: Color32 = Color32::from_rgb(0xEF, 0x9F, 0x27);
@@ -36,6 +35,36 @@ enum Page {
     Settings,
 }
 
+/// A message kept as its English key plus arguments, so it's translated when shown and
+/// follows the interface language even after it was created.
+#[derive(Clone, PartialEq)]
+struct Msg {
+    key: &'static str,
+    args: Vec<String>,
+    from_engine: bool,
+}
+
+impl Msg {
+    fn new(key: &'static str, args: &[&str]) -> Self {
+        Self { key, args: args.iter().map(|a| a.to_string()).collect(), from_engine: false }
+    }
+    /// Text that can't be translated (errors from the engine, file system, ...).
+    fn raw(text: impl Into<String>) -> Self {
+        Self { key: "{}", args: vec![text.into()], from_engine: false }
+    }
+    /// A progress message from the Python helper (known ones get translated).
+    fn engine(text: impl Into<String>) -> Self {
+        Self { key: "{}", args: vec![text.into()], from_engine: true }
+    }
+    fn text(&self) -> String {
+        if self.from_engine {
+            return i18n::engine_status(&self.args[0]);
+        }
+        let args: Vec<&str> = self.args.iter().map(|a| a.as_str()).collect();
+        tf(self.key, &args)
+    }
+}
+
 #[derive(Clone, PartialEq)]
 enum Status {
     Ready,
@@ -44,8 +73,7 @@ enum Status {
     Generating,
     Speaking,
     SpeakingSaved,
-    /// Already-translated one-off message.
-    Msg(String),
+    Msg(Msg),
 }
 
 impl Status {
@@ -57,7 +85,7 @@ impl Status {
             Status::Generating => t("Generating…").into(),
             Status::Speaking => t("Speaking").into(),
             Status::SpeakingSaved => t("Speaking (saved audio)").into(),
-            Status::Msg(m) => m.clone(),
+            Status::Msg(m) => m.text(),
         }
     }
 }
@@ -106,6 +134,10 @@ pub struct App {
     tx: Tx,
 
     helpers: HashMap<String, Hs>,
+    /// Key of the helper that speaks. Every helper gets a fresh key, so a late "exited"
+    /// event from a replaced helper can't be mistaken for the new one.
+    main_key: String,
+    helper_gen: u64,
     downloads: HashMap<String, Download>,
     paused_downloads: HashMap<String, f32>,
     /// Model download progress (MB) by model key, from any helper.
@@ -127,19 +159,23 @@ pub struct App {
     history_pos: Option<usize>,
     focus_text: bool,
     status: Status,
-    error: Option<String>,
+    error: Option<Msg>,
     show_all_engines: bool,
     installs: HashMap<String, Install>,
     paused_installs: HashMap<String, f32>,
     vmic_step: Option<String>,
-    vmic_msg: Option<(bool, String)>,
+    vmic_msg: Option<(bool, Msg)>,
     benching: HashMap<String, String>,
     agree_prompt: Option<String>,
+    delete_prompt: Option<String>,
+    deleting: HashSet<String>,
+    cache_msg: Option<Msg>,
+    cleaning_cache: bool,
     voices: Vec<String>,
     importing: bool,
     hotkey_text: String,
     hf_input: String,
-    hf_msg: Option<String>,
+    hf_msg: Option<Msg>,
     hotkey_mgr: Option<global_hotkey::GlobalHotKeyManager>,
     hotkey_cur: Option<global_hotkey::hotkey::HotKey>,
     frames: u32,
@@ -183,6 +219,8 @@ impl App {
             rx,
             tx,
             helpers: HashMap::new(),
+            main_key: String::new(),
+            helper_gen: 0,
             downloads: HashMap::new(),
             paused_downloads: HashMap::new(),
             model_dl: HashMap::new(),
@@ -208,6 +246,10 @@ impl App {
             vmic_msg: None,
             benching: HashMap::new(),
             agree_prompt: None,
+            delete_prompt: None,
+            deleting: HashSet::new(),
+            cache_msg: None,
+            cleaning_cache: false,
             voices: config::list_voices(),
             importing: false,
             hf_input: String::new(),
@@ -284,9 +326,9 @@ impl App {
         match self.cfg.hotkey.parse::<global_hotkey::hotkey::HotKey>() {
             Ok(hk) => match mgr.register(hk) {
                 Ok(()) => self.hotkey_cur = Some(hk),
-                Err(e) => self.error = Some(tf("Couldn't register {}: {}", &[&self.cfg.hotkey, &e.to_string()])),
+                Err(e) => self.error = Some(Msg::new("Couldn't register {}: {}", &[&self.cfg.hotkey, &e.to_string()])),
             },
-            Err(e) => self.error = Some(tf("Bad shortcut \"{}\": {}", &[&self.cfg.hotkey, &e.to_string()])),
+            Err(e) => self.error = Some(Msg::new("Bad shortcut \"{}\": {}", &[&self.cfg.hotkey, &e.to_string()])),
         }
     }
 
@@ -314,7 +356,7 @@ impl App {
                 true
             }
             Err(err) => {
-                self.error = Some(tf("Couldn't start engine: {}", &[&err.to_string()]));
+                self.error = Some(Msg::new("Couldn't start engine: {}", &[&err.to_string()]));
                 false
             }
         }
@@ -324,24 +366,36 @@ impl App {
     fn ensure_main(&mut self) {
         let Some(e) = self.engine().cloned() else { return };
         if !engine::is_installed(&e.env) {
-            self.helpers.remove(MAIN);
+            self.helpers.remove(&self.main_key);
             return;
         }
-        let alive = self.helpers.get_mut(MAIN).map(|hs| hs.h.env == e.env && hs.h.is_alive()).unwrap_or(false);
+        let alive = self.helpers.get_mut(&self.main_key).map(|hs| hs.h.env == e.env && hs.h.is_alive()).unwrap_or(false);
         if alive {
-            if self.helpers.get(MAIN).map(|hs| hs.ready).unwrap_or(false) {
+            if self.helpers.get(&self.main_key).map(|hs| hs.ready).unwrap_or(false) {
                 self.preload(false);
             }
             return;
         }
-        self.helpers.remove(MAIN);
-        if self.spawn_helper(MAIN, &e) {
+        self.helpers.remove(&self.main_key);
+        let key = self.next_key("main");
+        if self.spawn_helper(&key, &e) {
+            self.main_key = key;
             self.status = Status::StartingEngine;
         }
     }
 
+    fn next_key(&mut self, prefix: &str) -> String {
+        self.helper_gen += 1;
+        format!("{prefix}#{}", self.helper_gen)
+    }
+
+    /// The background-download helper for a model, if one is running.
+    fn download_helper(&self, model_key: &str) -> Option<String> {
+        self.downloads.iter().find(|(_, d)| d.key == model_key).map(|(k, _)| k.clone())
+    }
+
     fn restart_main(&mut self) {
-        self.helpers.remove(MAIN);
+        self.helpers.remove(&self.main_key);
         self.ensure_main();
     }
 
@@ -357,7 +411,7 @@ impl App {
             return;
         }
         let voice = self.cfg.voice_path();
-        let Some(hs) = self.helpers.get_mut(MAIN) else { return };
+        let Some(hs) = self.helpers.get_mut(&self.main_key) else { return };
         if !force && (hs.loaded.contains_key(&key) || hs.loading.as_deref() == Some(key.as_str())) {
             return;
         }
@@ -380,10 +434,10 @@ impl App {
         }
         let lang = e.load_language(&self.cfg.language).to_string();
         let key = e.model_key(&lang);
-        let hkey = format!("dl:{key}");
-        if self.helpers.contains_key(&hkey) {
+        if self.download_helper(&key).is_some() {
             return;
         }
+        let hkey = self.next_key(&format!("dl:{key}"));
         self.paused_downloads.remove(&key);
         if self.spawn_helper(&hkey, e) {
             self.downloads.insert(hkey, Download { engine: e.id.clone(), lang, key: key.clone() });
@@ -392,9 +446,10 @@ impl App {
     }
 
     fn pause_download(&mut self, key: &str) {
-        let hkey = format!("dl:{key}");
-        self.helpers.remove(&hkey); // killing the helper stops the download; resuming continues it
-        self.downloads.remove(&hkey);
+        if let Some(hkey) = self.download_helper(key) {
+            self.helpers.remove(&hkey); // stopping the helper stops the download; resuming continues it
+            self.downloads.remove(&hkey);
+        }
         let done = self.model_dl.remove(key).unwrap_or(0.0);
         self.paused_downloads.insert(key.to_string(), done);
         if self.switch_to.as_deref().and_then(|id| self.engine_by_id(id)).map(|e| self.model_key_for(&e) == key).unwrap_or(false) {
@@ -402,7 +457,7 @@ impl App {
         }
     }
 
-    fn finish_download(&mut self, hkey: &str, result: Result<String, String>) {
+    fn finish_download(&mut self, hkey: &str, result: Result<String, Msg>) {
         self.helpers.remove(hkey);
         let Some(dl) = self.downloads.remove(hkey) else { return };
         self.model_dl.remove(&dl.key);
@@ -421,7 +476,10 @@ impl App {
                     self.cfg.save();
                     self.ensure_main();
                 }
-                self.status = Status::Msg(t("Model downloaded").into());
+                let name = self.engine_by_id(&dl.engine).map(|e| e.name).unwrap_or_default();
+                self.status = Status::Msg(Msg::new("{} is ready", &[&name]));
+                let (chime, sr) = audio::chime();
+                self.player.play_local(&chime, sr);
             }
             Err(err) => {
                 self.paused_downloads.insert(dl.key, 0.0);
@@ -442,6 +500,54 @@ impl App {
             self.switch_to = Some(e.id.clone());
             self.start_download(e);
         }
+    }
+
+    // ---------- deleting engines ----------
+
+    /// Has anything of this engine landed on disk (packages, model, or a partial download)?
+    fn has_files(&self, e: &Engine) -> bool {
+        engine::is_installed(&e.env)
+            || config::envs_dir().join(&e.env).exists()
+            || e.hf_repos.iter().any(|r| config::hf_hub_dir().join(format!("models--{}", r.replace('/', "--"))).exists())
+    }
+
+    fn delete_engine(&mut self, e: &Engine) {
+        let Some(cat) = self.catalog.clone() else { return };
+        let same_env: Vec<Engine> = cat.engines.iter().filter(|o| o.env == e.env).cloned().collect();
+        // Stop everything that uses these files first.
+        if self.helpers.get(&self.main_key).map(|h| h.h.env == e.env).unwrap_or(false) {
+            self.helpers.remove(&self.main_key);
+        }
+        let dl_keys: Vec<String> = self
+            .downloads
+            .iter()
+            .filter(|(_, d)| same_env.iter().any(|o| o.id == d.engine))
+            .map(|(k, _)| k.clone())
+            .collect();
+        for k in dl_keys {
+            if let Some(d) = self.downloads.remove(&k) {
+                self.model_dl.remove(&d.key);
+            }
+            self.helpers.remove(&k);
+        }
+        if let Some(inst) = self.installs.remove(&e.env) {
+            engine::cancel_install(&inst.handle);
+        }
+        self.paused_installs.remove(&e.env);
+        // Models: this engine's repos, which may be shared (Pocket and Pocket Large).
+        let repos = e.hf_repos.clone();
+        let affected: Vec<Engine> = cat.engines.iter().filter(|o| o.hf_repos.iter().any(|r| repos.contains(r)) || o.env == e.env).cloned().collect();
+        for o in &affected {
+            let id = o.id.clone();
+            self.cfg.forget_downloaded(|k| k == id || k.starts_with(&format!("{id}:")));
+            self.paused_downloads.retain(|k, _| !(k == &id || k.starts_with(&format!("{id}:"))));
+        }
+        if self.switch_to.as_deref().map(|s| affected.iter().any(|o| o.id == s)).unwrap_or(false) {
+            self.switch_to = None;
+        }
+        self.cfg.save();
+        self.deleting.insert(e.id.clone());
+        engine::delete_engine_files(e.id.clone(), Some(e.env.clone()), repos, self.tx.clone());
     }
 
     // ---------- phrase audio cache ----------
@@ -533,7 +639,7 @@ impl App {
             self.stop(); // a new line interrupts the old one
         }
         if self.cfg.voice_path().is_none() {
-            self.error = Some(t("Add your voice clip first.").into());
+            self.error = Some(Msg::new("Add your voice clip first.", &[]));
             self.page = Page::Voices;
             self.expand(true);
             return;
@@ -548,38 +654,38 @@ impl App {
         }
         let Some(e) = self.engine().cloned() else { return };
         if !engine::is_installed(&e.env) {
-            self.error = Some(tf("Install {} first.", &[&e.name]));
+            self.error = Some(Msg::new("Install {} first.", &[&e.name]));
             self.page = Page::Engines;
             self.expand(true);
             return;
         }
         if !self.cfg.is_downloaded(&self.model_key_for(&e)) {
             self.preload(false);
-            self.error = Some(tf("{} is still downloading. Pick another engine meanwhile.", &[&e.name]));
+            self.error = Some(Msg::new("{} is still downloading. Pick another engine meanwhile.", &[&e.name]));
             return;
         }
         self.ensure_main();
-        let ready = self.helpers.get(MAIN).map(|hs| hs.ready).unwrap_or(false);
+        let ready = self.helpers.get(&self.main_key).map(|hs| hs.ready).unwrap_or(false);
         if !ready {
             self.queued = Some(text);
             return;
         }
         let voice = self.cfg.voice_path().unwrap_or_default();
         let lang = self.cfg.language.clone();
-        let Some(hs) = self.helpers.get_mut(MAIN) else { return };
+        let Some(hs) = self.helpers.get_mut(&self.main_key) else { return };
         match hs.h.speak(&e.id, &text, &voice, &lang, e.model_mb) {
             Ok(id) => {
                 self.current_req = Some(id);
                 self.pending = Some(Pending { req: id, text, chunks: vec![], secs: 0.0, playing: false, all: vec![], sr: 24000 });
                 self.status = Status::Generating;
             }
-            Err(err) => self.error = Some(tf("Engine error: {}", &[&err.to_string()])),
+            Err(err) => self.error = Some(Msg::new("Engine error: {}", &[&err.to_string()])),
         }
     }
 
     fn stop(&mut self) {
         if self.current_req.is_some() {
-            if let Some(hs) = self.helpers.get_mut(MAIN) {
+            if let Some(hs) = self.helpers.get_mut(&self.main_key) {
                 hs.h.cancel();
             }
         }
@@ -719,7 +825,7 @@ impl App {
                     if let Some(hs) = self.helpers.get_mut(&key) {
                         hs.ready = true;
                     }
-                    if key == MAIN {
+                    if key == self.main_key {
                         self.status = Status::Ready;
                         self.preload(false);
                         if let Some(t) = self.queued.take() {
@@ -732,18 +838,18 @@ impl App {
                     }
                 }
                 Event::HelperExited { key, msg } => {
-                    if key == MAIN {
-                        if self.helpers.remove(MAIN).is_some() {
-                            self.error = Some(tf("Engine stopped. {}", &[&msg]));
+                    if key == self.main_key {
+                        if self.helpers.remove(&self.main_key).is_some() {
+                            self.error = Some(Msg::new("Engine stopped. {}", &[&msg]));
                             self.status = Status::Ready;
                         }
                     } else if self.downloads.contains_key(&key) {
-                        self.finish_download(&key, Err(tf("Download stopped. {}", &[&msg])));
+                        self.finish_download(&key, Err(Msg::new("Download stopped. {}", &[&msg])));
                     }
                 }
                 Event::HelperStatus { key, msg } => {
-                    if key == MAIN && self.current_req.is_none() {
-                        self.status = Status::Msg(i18n::engine_status(&msg));
+                    if key == self.main_key && self.current_req.is_none() {
+                        self.status = Status::Msg(Msg::engine(msg));
                     }
                 }
                 Event::Status(s) => {
@@ -756,16 +862,16 @@ impl App {
                         self.cfg.voice = Some(name.clone());
                         self.cfg.save();
                         self.error = None;
-                        self.status = Status::Msg(tf("Added \"{}\" ({} s)", &[&name, &secs]));
+                        self.status = Status::Msg(Msg::new("Added \"{}\" ({} s)", &[&name, &secs]));
                         self.preload(true);
                     } else if let Some(e) = s.strip_prefix("voice-err:") {
                         self.importing = false;
-                        self.error = Some(tf("Couldn't use that file: {}", &[e]));
+                        self.error = Some(Msg::new("Couldn't use that file: {}", &[e]));
                     }
                 }
                 Event::LoadDone { key, result } => {
-                    if key == MAIN {
-                        let Some(hs) = self.helpers.get_mut(MAIN) else { continue };
+                    if key == self.main_key {
+                        let Some(hs) = self.helpers.get_mut(&self.main_key) else { continue };
                         let mk = hs.loading.take();
                         match result {
                             Ok(dev) => {
@@ -783,17 +889,17 @@ impl App {
                                 if let Some(mk) = mk {
                                     self.model_dl.remove(&mk);
                                 }
-                                self.error = Some(e);
+                                self.error = Some(Msg::raw(e));
                                 self.status = Status::Ready;
                             }
                         }
                     } else if self.downloads.contains_key(&key) {
-                        self.finish_download(&key, result);
+                        self.finish_download(&key, result.map_err(Msg::raw));
                     }
                 }
                 Event::ModelProgress { key, done_mb } => {
-                    let mk = if key == MAIN {
-                        self.helpers.get(MAIN).and_then(|hs| hs.loading.clone())
+                    let mk = if key == self.main_key {
+                        self.helpers.get(&self.main_key).and_then(|hs| hs.loading.clone())
                     } else {
                         self.downloads.get(&key).map(|d| d.key.clone())
                     };
@@ -837,7 +943,7 @@ impl App {
                             }
                         }
                         if let Err(e) = result {
-                            self.error = Some(e);
+                            self.error = Some(Msg::raw(e));
                         }
                     }
                 }
@@ -858,17 +964,17 @@ impl App {
                     let inst = self.installs.remove(&env);
                     if ok {
                         self.paused_installs.remove(&env);
-                        self.status = Status::Msg(t("Engine installed").into());
+                        self.status = Status::Ready;
                         self.after_install(&env);
                     } else if cancelled {
                         self.paused_installs.insert(env, inst.map(|i| i.mb).unwrap_or(0.0));
                     } else {
                         self.paused_installs.insert(env, inst.as_ref().map(|i| i.mb).unwrap_or(0.0));
-                        self.error = Some(tf("Install failed: {}", &[&inst.map(|i| i.line).unwrap_or_default()]));
+                        self.error = Some(Msg::new("Install failed: {}", &[&inst.map(|i| i.line).unwrap_or_default()]));
                     }
                 }
                 Event::BenchStatus { model, msg } => {
-                    self.benching.insert(model, i18n::engine_status(&msg));
+                    self.benching.insert(model, msg);
                 }
                 Event::BenchDone { model, result } => {
                     self.benching.remove(&model);
@@ -877,11 +983,11 @@ impl App {
                             self.cfg.bench.insert(model, r);
                             self.cfg.save();
                         }
-                        Err(e) => self.error = Some(tf("Test failed: {}", &[&e])),
+                        Err(e) => self.error = Some(Msg::new("Test failed: {}", &[&e])),
                     }
                 }
                 Event::VmicLine(step) => {
-                    self.vmic_step = Some(i18n::vmic_step(&step));
+                    self.vmic_step = Some(step);
                 }
                 Event::VmicDone { code } => {
                     self.vmic_step = None;
@@ -890,16 +996,33 @@ impl App {
                         0 if self.player.has_mic() => {
                             self.cfg.vmic_setup = true;
                             self.cfg.save();
-                            (true, tf("Virtual mic ready. In Discord: Settings > Voice & Video > Input Device > {}.", &[vmic_discord_name()]))
+                            (true, Msg::new("Virtual mic ready. In Discord: Settings > Voice & Video > Input Device > {}.", &[vmic_discord_name()]))
                         }
-                        0 => (true, t("Installed. Restart your PC to finish, then open Corvox again.").into()),
-                        2 => (false, t("Cancelled: the Windows permission prompt was declined.").into()),
-                        3 => (false, t("Stopped: the installer isn't signed by VB-Audio. Nothing was installed.").into()),
-                        4 => (false, t("Couldn't download VB-Cable. Check your internet connection.").into()),
-                        c => (false, tf("Setup failed (code {}).", &[&c.to_string()])),
+                        0 => (true, Msg::new("Installed. Restart your PC to finish, then open Corvox again.", &[])),
+                        2 => (false, Msg::new("Cancelled: the Windows permission prompt was declined.", &[])),
+                        3 => (false, Msg::new("Stopped: the installer isn't signed by VB-Audio. Nothing was installed.", &[])),
+                        4 => (false, Msg::new("Couldn't download VB-Cable. Check your internet connection.", &[])),
+                        c => (false, Msg::new("Setup failed (code {}).", &[&c.to_string()])),
                     });
                 }
                 Event::Hotkey => self.on_hotkey(),
+                Event::DeleteDone { engine, freed_mb, error } => {
+                    self.deleting.remove(&engine);
+                    let name = self.engine_by_id(&engine).map(|e| e.name).unwrap_or(engine);
+                    match error {
+                        None => self.status = Status::Msg(Msg::new("Deleted {} (freed {})", &[&name, &fmt_mb(freed_mb)])),
+                        Some(e) => self.error = Some(Msg::new("Couldn't delete everything: {}", &[&e])),
+                    }
+                    self.fix_engine_for_language();
+                    self.ensure_main();
+                }
+                Event::CacheCleaned { result } => {
+                    self.cleaning_cache = false;
+                    self.cache_msg = Some(match result {
+                        Ok(line) => Msg::new("Download cache cleared. {}", &[&line]),
+                        Err(e) => Msg::new("Couldn't clear the cache: {}", &[&e]),
+                    });
+                }
             }
         }
     }
@@ -936,11 +1059,15 @@ impl App {
             ui.ctx().send_viewport_cmd(egui::ViewportCommand::StartDrag);
         }
         ui.scope_builder(UiBuilder::new().max_rect(rect).layout(Layout::left_to_right(Align::Center)), |ui| {
-            icons::small(ui, Icon::Mic, ui.visuals().weak_text_color());
-            ui.label(RichText::new(APP_NAME).color(ui.visuals().weak_text_color()));
+            icons::small(ui, Icon::Mic, ui.visuals().text_color());
+            ui.label(RichText::new(APP_NAME).color(ui.visuals().text_color()));
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 if icons::button(ui, Icon::Close, t("Close")).clicked() {
                     ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+                // Same spot as the bar's expand button, so switching back and forth needs no mouse move.
+                if icons::button(ui, Icon::ChevronDown, t("Collapse to a bar")).clicked() {
+                    self.expand(false);
                 }
                 let on_top = self.cfg.always_on_top;
                 let (icon, tip) = if on_top {
@@ -951,9 +1078,6 @@ impl App {
                 let tint = if on_top { ui.visuals().selection.stroke.color } else { ui.visuals().weak_text_color() };
                 if icons::button_tinted(ui, icon, tint, tip).clicked() {
                     self.set_on_top(!on_top);
-                }
-                if icons::button(ui, Icon::ChevronDown, t("Collapse to a bar")).clicked() {
-                    self.expand(false);
                 }
                 let st_tint = if self.page == Page::Settings { ui.visuals().selection.stroke.color } else { ui.visuals().widgets.inactive.fg_stroke.color };
                 if icons::button_tinted(ui, Icon::Sliders, st_tint, t("Settings")).clicked() {
@@ -1033,6 +1157,17 @@ impl App {
         if let Some(p) = self.selected_download() {
             return tf("Downloading model {}", &[&p]);
         }
+        // Any other background download or install, so it never looks finished early.
+        if let Some(dl) = self.downloads.values().next() {
+            if let Some(e) = self.engine_by_id(&dl.engine) {
+                let p = self.model_dl.get(&dl.key).map(|d| pct_or_mb(*d, e.model_mb)).unwrap_or_default();
+                return tf("Downloading {} {}", &[&short_name(&e.name), &p]);
+            }
+        }
+        if let Some(env) = self.installs.keys().next() {
+            let name = self.catalog.as_ref().and_then(|c| c.engines.iter().find(|e| &e.env == env)).map(|e| short_name(&e.name)).unwrap_or_default();
+            return tf("Installing {}…", &[&name]);
+        }
         self.status.text()
     }
 
@@ -1044,7 +1179,7 @@ impl App {
         let text = self.status_text();
         let col = if self.error.is_some() {
             RED
-        } else if busy || self.status != Status::Ready || self.selected_download().is_some() {
+        } else if busy || self.status != Status::Ready || !self.downloads.is_empty() || !self.installs.is_empty() {
             AMBER
         } else {
             GREEN
@@ -1057,7 +1192,7 @@ impl App {
     fn error_line(&mut self, ui: &mut egui::Ui) {
         if let Some(e) = self.error.clone() {
             ui.horizontal_wrapped(|ui| {
-                ui.label(RichText::new(e).color(RED).small());
+                ui.label(RichText::new(e.text()).color(RED).small());
                 if icons::button(ui, Icon::Close, t("Dismiss")).clicked() {
                     self.error = None;
                 }
@@ -1070,6 +1205,7 @@ impl App {
         ui.spacing_mut().slider_width = 70.0;
         let mut changed_gain = false;
         if self.cfg.monitor {
+            ui.add_sized([32.0, 16.0], egui::Label::new(RichText::new(format!("{:.0}%", self.cfg.monitor_volume * 100.0)).small()));
             let r = ui
                 .add(egui::Slider::new(&mut self.cfg.monitor_volume, 0.0..=1.0).show_value(false))
                 .on_hover_text(t("Volume on your speakers/headphones. Discord always gets full volume."));
@@ -1219,11 +1355,11 @@ impl App {
     fn start_vmic_setup(&mut self, ctx: &egui::Context) {
         if cfg!(target_os = "macos") {
             ctx.open_url(egui::OpenUrl::new_tab(vmic::BLACKHOLE_URL));
-            self.vmic_msg = Some((true, t("Install BlackHole 2ch from that page, then click Refresh here.").into()));
+            self.vmic_msg = Some((true, Msg::new("Install BlackHole 2ch from that page, then click Refresh here.", &[])));
             return;
         }
         self.vmic_msg = None;
-        self.vmic_step = Some(t("Starting…").into());
+        self.vmic_step = Some("Starting…".into());
         vmic::setup(self.tx.clone());
     }
 
@@ -1232,11 +1368,11 @@ impl App {
         if let Some(step) = self.vmic_step.clone() {
             ui.horizontal(|ui| {
                 ui.spinner();
-                ui.label(RichText::new(step).small());
+                ui.label(RichText::new(i18n::vmic_step(&step)).small());
             });
         } else if let Some((ok, msg)) = self.vmic_msg.clone() {
             ui.horizontal_wrapped(|ui| {
-                ui.label(RichText::new(msg).small().color(if ok { GREEN } else { RED }));
+                ui.label(RichText::new(msg.text()).small().color(if ok { GREEN } else { RED }));
                 if icons::button(ui, Icon::Close, t("Dismiss")).clicked() {
                     self.vmic_msg = None;
                 }
@@ -1256,12 +1392,12 @@ impl App {
         if let Some(step) = self.vmic_step.clone() {
             ui.horizontal(|ui| {
                 ui.spinner();
-                ui.label(RichText::new(step).small());
+                ui.label(RichText::new(i18n::vmic_step(&step)).small());
             });
             return;
         }
         if let Some((ok, msg)) = self.vmic_msg.clone() {
-            ui.label(RichText::new(msg).small().color(if ok { GREEN } else { RED }));
+            ui.label(RichText::new(msg.text()).small().color(if ok { GREEN } else { RED }));
         }
         if self.player.has_mic() {
             return;
@@ -1409,9 +1545,12 @@ impl App {
                 let rect = stats.response.rect;
                 let bg = ui.visuals().panel_fill.gamma_multiply(0.6);
                 ui.painter().rect_filled(rect, CornerRadius::same(6), bg);
-                ui.put(rect.shrink2(Vec2::new(10.0, 4.0)), egui::Label::new(RichText::new(e.summary_for(&ui_lang)).strong()).wrap());
+                ui.put(
+                    rect.shrink2(Vec2::new(10.0, 4.0)),
+                    egui::Label::new(RichText::new(e.summary_for(&ui_lang)).strong()).wrap().halign(Align::Center),
+                );
             }
-            let on_cpu = self.helpers.get(MAIN).and_then(|hs| hs.loaded.get(&mkey)).map(|d| d == "cpu").unwrap_or(false);
+            let on_cpu = self.helpers.get(&self.main_key).and_then(|hs| hs.loaded.get(&mkey)).map(|d| d == "cpu").unwrap_or(false);
             if on_cpu && e.is_gpu() && selected {
                 ui.label(RichText::new(t("No CUDA GPU found, so this engine is running on the CPU.")).small().color(GOLD));
             }
@@ -1425,8 +1564,48 @@ impl App {
         }
     }
 
+    /// Delete button (with a confirmation step) for an engine that has files on disk.
+    fn delete_row(&mut self, ui: &mut egui::Ui, cat: &Catalog, e: &Engine) {
+        if self.deleting.contains(&e.id) {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label(RichText::new(t("Deleting…")).small());
+            });
+            return;
+        }
+        if self.delete_prompt.as_deref() != Some(e.id.as_str()) {
+            return;
+        }
+        let shared: Vec<String> = cat.engines.iter().filter(|o| o.env == e.env && o.id != e.id).map(|o| o.name.clone()).collect();
+        let mb = if config::envs_dir().join(&e.env).exists() { e.env_mb } else { 0 } + e.model_mb;
+        ui.add_space(2.0);
+        ui.label(RichText::new(tf("Delete {}'s packages and model (about {})? You can install it again later.", &[&e.name, &fmt_mb(mb as f32)])).small().color(GOLD));
+        if !shared.is_empty() {
+            ui.label(RichText::new(tf("This also removes {}, which share the same install.", &[&shared.join(", ")])).small().color(GOLD));
+        }
+        ui.horizontal(|ui| {
+            if icons::labeled(ui, Icon::Trash, t("Delete")).clicked() {
+                self.delete_prompt = None;
+                self.delete_engine(e);
+            }
+            if ui.button(t("Cancel")).clicked() {
+                self.delete_prompt = None;
+            }
+        });
+    }
+
+    fn delete_button(&mut self, ui: &mut egui::Ui, e: &Engine) {
+        if self.has_files(e) && !self.deleting.contains(&e.id) && icons::button(ui, Icon::Trash, t("Delete this engine's files")).clicked() {
+            self.delete_prompt = Some(e.id.clone());
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn engine_actions(&mut self, ui: &mut egui::Ui, cat: &Catalog, e: &Engine, installed: bool, downloaded: bool, speaks_lang: bool, mkey: &str, waiting: bool) {
+        self.delete_row(ui, cat, e);
+        if self.deleting.contains(&e.id) {
+            return;
+        }
         // Step 1: Python packages.
         if let Some(inst) = self.installs.get(&e.env) {
             let frac = (inst.mb / e.env_mb as f32).min(0.99);
@@ -1449,6 +1628,7 @@ impl App {
             ui.horizontal(|ui| {
                 ui.label(RichText::new(tf("Install paused · {} of ~{}", &[&fmt_mb(mb), &fmt_mb(e.env_mb as f32)])).small().color(GOLD));
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    self.delete_button(ui, e);
                     if icons::labeled(ui, Icon::Play, t("Resume")).clicked() {
                         self.start_install(&e.env);
                     }
@@ -1464,7 +1644,7 @@ impl App {
                 let label = if waiting { t("Step 2 of 2 · Downloading the model (switches when done)") } else { t("Step 2 of 2 · Downloading the model") };
                 ui.label(RichText::new(label).small());
                 ui.add(egui::ProgressBar::new(frac).desired_height(12.0).text(RichText::new(tf("{} of ~{}", &[&fmt_mb(done), &fmt_mb(e.model_mb as f32)])).small()));
-                let background = self.helpers.contains_key(&format!("dl:{mkey}"));
+                let background = self.download_helper(mkey).is_some();
                 if background {
                     ui.horizontal(|ui| {
                         ui.label(RichText::new(t("Your current engine keeps working meanwhile.")).small().weak());
@@ -1486,6 +1666,7 @@ impl App {
                 };
                 ui.label(RichText::new(text).small().color(GOLD));
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    self.delete_button(ui, e);
                     let (icon, label) = if paused.is_some() { (Icon::Play, t("Resume")) } else { (Icon::Download, t("Download")) };
                     if icons::labeled(ui, icon, label).clicked() {
                         self.start_download(e);
@@ -1519,7 +1700,7 @@ impl App {
                 }
             } else if let Some(msg) = self.benching.get(&e.id) {
                 ui.spinner();
-                ui.label(RichText::new(msg).small());
+                ui.label(RichText::new(i18n::engine_status(msg)).small());
             } else if speaks_lang {
                 let can = self.cfg.voice_path().is_some();
                 let r = ui.add_enabled_ui(can, |ui| icons::labeled(ui, Icon::Gauge, t("Test on my PC"))).inner;
@@ -1528,6 +1709,7 @@ impl App {
                 }
             }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                self.delete_button(ui, e);
                 ui.hyperlink_to(RichText::new(t("info")).small(), &e.url);
                 let size = if installed {
                     t("installed").to_string()
@@ -1554,7 +1736,7 @@ impl App {
 
     fn start_bench(&mut self, e: &Engine) {
         let (Some(uv), Some(dir), Some(voice)) = (self.uv.clone(), self.engines_dir.clone(), self.cfg.voice_path()) else { return };
-        self.benching.insert(e.id.clone(), t("Starting…").into());
+        self.benching.insert(e.id.clone(), "Starting…".into());
         engine::bench(uv, dir, e.env.clone(), e.id.clone(), voice, self.cfg.language.clone(), self.agreed(&e.id), self.cfg.int8, self.tx.clone());
     }
 
@@ -1756,13 +1938,40 @@ impl App {
                     Ok(()) => {
                         self.hf_input.clear();
                         self.restart_main(); // reload models with the cloning weights
-                        t("Saved. Restarting the engine.").into()
+                        Msg::new("Saved. Restarting the engine.", &[])
                     }
-                    Err(e) => tf("Couldn't save: {}", &[&e.to_string()]),
+                    Err(e) => Msg::new("Couldn't save: {}", &[&e.to_string()]),
                 });
             }
             if let Some(m) = &self.hf_msg {
-                ui.label(RichText::new(m).small().weak());
+                ui.label(RichText::new(m.text()).small().weak());
+            }
+
+            ui.add_space(8.0);
+            ui.label(RichText::new(t("Download cache")).small().weak());
+            ui.label(
+                RichText::new(t("uv keeps downloaded packages so reinstalling is fast. Clearing it frees space; installed engines keep working."))
+                    .small()
+                    .weak(),
+            );
+            ui.horizontal(|ui| {
+                if self.cleaning_cache {
+                    ui.spinner();
+                    ui.label(RichText::new(t("Clearing…")).small());
+                } else {
+                    let can = self.uv.is_some() && self.installs.is_empty();
+                    let r = ui.add_enabled_ui(can, |ui| icons::labeled(ui, Icon::Trash, t("Clear download cache"))).inner;
+                    if r.on_disabled_hover_text(t("Wait for installs to finish")).clicked() {
+                        if let Some(uv) = self.uv.clone() {
+                            self.cleaning_cache = true;
+                            self.cache_msg = None;
+                            engine::clean_uv_cache(uv, self.tx.clone());
+                        }
+                    }
+                }
+            });
+            if let Some(m) = &self.cache_msg {
+                ui.label(RichText::new(m.text()).small().weak());
             }
 
             ui.add_space(8.0);
@@ -1808,7 +2017,7 @@ impl App {
                 let col = if self.error.is_some() { RED } else { ui.visuals().weak_text_color() };
                 let r = ui.label(RichText::new(tag).small().color(col));
                 if let Some(e) = &self.error {
-                    r.on_hover_text(e);
+                    r.on_hover_text(e.text());
                 }
             });
         });
@@ -1818,7 +2027,7 @@ impl App {
     fn debug_screenshot(&mut self, ctx: &egui::Context) {
         let Ok(path) = std::env::var("CORVOX_SHOT") else { return };
         self.frames += 1;
-        let main_ready = self.helpers.get(MAIN).map(|h| h.ready).unwrap_or(false);
+        let main_ready = self.helpers.get(&self.main_key).map(|h| h.ready).unwrap_or(false);
         let waiting = std::env::var("CORVOX_SAY").is_ok() && (self.busy() || self.queued.is_some() || !main_ready);
         if waiting && self.frames < 2400 {
             self.frames = self.frames.min(38);
@@ -1859,7 +2068,7 @@ impl eframe::App for App {
             || !self.benching.is_empty()
             || self.ptt.is_held()
             || !self.model_dl.is_empty()
-            || self.helpers.get(MAIN).map(|h| h.loading.is_some()).unwrap_or(false);
+            || self.helpers.get(&self.main_key).map(|h| h.loading.is_some()).unwrap_or(false);
         if active || starting {
             ui.ctx().request_repaint_after(Duration::from_millis(100));
         }
@@ -1869,7 +2078,7 @@ impl eframe::App for App {
             .fill(visuals.panel_fill)
             .stroke(visuals.widgets.noninteractive.bg_stroke)
             .corner_radius(CornerRadius::same(if platform::native_corners() { 0 } else if collapsed { 28 } else { 10 }))
-            .inner_margin(if collapsed { egui::Margin::symmetric(12, 8) } else { egui::Margin::same(10) });
+            .inner_margin(if collapsed { egui::Margin::symmetric(10, 8) } else { egui::Margin::same(10) });
         egui::CentralPanel::default().frame(frame).show(ui, |ui| {
             if collapsed {
                 self.pill(ui);

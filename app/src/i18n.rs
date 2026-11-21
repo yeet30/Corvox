@@ -69,6 +69,7 @@ pub fn vmic_step(step: &str) -> String {
         return format!("PowerShell başlatılamadı: {rest}");
     }
     match step {
+        "Starting…" => "Başlatılıyor…",
         "Approve the Windows prompt, then click Install Driver" => "Windows iznini onayla, sonra Install Driver'a tıkla",
         "Creating the Corvox virtual mic" => "Corvox sanal mikrofonu oluşturuluyor",
         "pactl failed. Is PipeWire or PulseAudio running?" => "pactl başarısız oldu. PipeWire ya da PulseAudio çalışıyor mu?",
@@ -294,6 +295,28 @@ fn tr(en: &str) -> Option<&'static str> {
         "not installed" => "kurulu değil",
         "Engines: {}" => "Motorlar: {}",
         "Data: {}" => "Veriler: {}",
+
+        // downloads, deleting, cache
+        "{} is ready" => "{} hazır",
+        "Downloading {} {}" => "{} indiriliyor {}",
+        "Installing {}…" => "{} kuruluyor…",
+        "Deleted {} (freed {})" => "{} silindi ({} boşaldı)",
+        "Couldn't delete everything: {}" => "Her şey silinemedi: {}",
+        "Deleting…" => "Siliniyor…",
+        "Delete {}'s packages and model (about {})? You can install it again later." => {
+            "{} paketleri ve modeli silinsin mi (yaklaşık {})? Daha sonra tekrar kurabilirsin."
+        }
+        "This also removes {}, which share the same install." => "Aynı kurulumu paylaştıkları için {} de kaldırılır.",
+        "Delete this engine's files" => "Bu motorun dosyalarını sil",
+        "Download cache" => "İndirme önbelleği",
+        "uv keeps downloaded packages so reinstalling is fast. Clearing it frees space; installed engines keep working." => {
+            "uv indirilen paketleri saklar, böylece yeniden kurmak hızlı olur. Temizlemek yer açar; kurulu motorlar çalışmaya devam eder."
+        }
+        "Clearing…" => "Temizleniyor…",
+        "Clear download cache" => "İndirme önbelleğini temizle",
+        "Wait for installs to finish" => "Kurulumların bitmesini bekle",
+        "Download cache cleared. {}" => "İndirme önbelleği temizlendi. {}",
+        "Couldn't clear the cache: {}" => "Önbellek temizlenemedi: {}",
         _ => return None,
     })
 }

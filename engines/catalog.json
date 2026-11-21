@@ -55,7 +55,11 @@
       "summary": "Fast on any CPU with a natural voice. Needs a free Hugging Face login to clone voices.",
       "summary_tr": "Her işlemcide hızlı, doğal bir ses. Ses klonlamak için ücretsiz Hugging Face girişi gerekir.",
       "note_tr": "Küçük ve hızlı. İşlemciler için yapıldı.",
-      "per_language_models": true
+      "per_language_models": true,
+      "hf_repos": [
+        "kyutai/pocket-tts",
+        "kyutai/pocket-tts-without-voice-cloning"
+      ]
     },
     {
       "id": "pocket-large",
@@ -84,7 +88,11 @@
       "summary": "Smoother and more natural than Pocket TTS, but slower. Needs a free Hugging Face login.",
       "summary_tr": "Pocket TTS'ten daha akıcı ve doğal, ama daha yavaş. Ücretsiz Hugging Face girişi gerekir.",
       "note_tr": "24 katmanlı sürüm: daha yavaş, genelde daha doğal.",
-      "per_language_models": true
+      "per_language_models": true,
+      "hf_repos": [
+        "kyutai/pocket-tts",
+        "kyutai/pocket-tts-without-voice-cloning"
+      ]
     },
     {
       "id": "pocket-tr",
@@ -106,7 +114,10 @@
       "summary": "Fast and light, runs on any CPU. Decent likeness to your voice. Turkish only.",
       "summary_tr": "Hızlı ve hafif, her işlemcide çalışır. Sesine idare eder bir benzerlik. Sadece Türkçe.",
       "note_tr": "Sürüm 0.1. Pocket TTS'ten 3 kat büyük. İngilizce kelimeleri Türkçe gibi okur.",
-      "per_language_models": false
+      "per_language_models": false,
+      "hf_repos": [
+        "kaanhgunay/pocket-tts-tr"
+      ]
     },
     {
       "id": "xtts",
@@ -145,7 +156,11 @@
       "summary": "The closest match to your voice and very clear. Needs an NVIDIA GPU and a big download (about 9 GB).",
       "summary_tr": "Sesine en çok benzeyen ve çok net. NVIDIA ekran kartı ve büyük bir indirme (yaklaşık 9 GB) gerekir.",
       "note_tr": "Ses benzerliği iyi. NVIDIA ekran kartı olmadan yavaş.",
-      "per_language_models": false
+      "per_language_models": false,
+      "hf_repos": [
+        "tts-hub/XTTS-v2",
+        "coqui/XTTS-v2"
+      ]
     },
     {
       "id": "chatterbox",
@@ -189,7 +204,10 @@
       "summary": "Very natural and expressive. Needs an NVIDIA GPU and the biggest download (about 10 GB).",
       "summary_tr": "Çok doğal ve duygulu. NVIDIA ekran kartı ve en büyük indirme (yaklaşık 10 GB) gerekir.",
       "note_tr": "Duygulu ve doğru. NVIDIA ekran kartı ister.",
-      "per_language_models": false
+      "per_language_models": false,
+      "hf_repos": [
+        "ResembleAI/chatterbox"
+      ]
     }
   ]
 }

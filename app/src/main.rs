@@ -26,6 +26,10 @@ fn main() -> eframe::Result {
     if cfg.always_on_top {
         viewport = viewport.with_always_on_top();
     }
+    if std::env::var_os("CORVOX_OFFSCREEN").is_some() {
+        // Testing: open off-screen without taking focus or a taskbar button.
+        viewport = viewport.with_position([-4000.0, -4000.0]).with_active(false).with_taskbar(false);
+    }
     let options = eframe::NativeOptions { viewport, ..Default::default() };
     eframe::run_native(app::APP_NAME, options, Box::new(move |cc| Ok(Box::new(app::App::new(cc, cfg)))))
 }

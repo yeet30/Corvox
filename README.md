@@ -10,7 +10,8 @@ Corvox copies your voice from a short clip (10–20 seconds, any audio file) and
 - Small native window (Rust + egui), collapses into a one-line bar (drag it from anywhere)
 - A global shortcut brings Corvox up; press it again to go back to the window you were in
 - Recent and pinned phrases: click one, or use ↑/↓, to say it again. Their audio is saved, so they replay instantly without the engine (can be turned off, and you choose how many to keep)
-- Engines install and download in the background with Pause/Resume, while the current one keeps working
+- Engines install and download in the background with Pause/Resume, while the current one keeps working; a chime plays when one is ready
+- Delete an engine's packages and model (including half-finished downloads) from its card; clear uv's download cache in Settings
 - English or Turkish interface
 - Pick a language, then any engine that speaks it. CPU engines work on any PC; GPU engines are optional
 - "Test on my PC" measures each engine with your voice: **voice match**, **clarity**, **speed**, **RAM/VRAM**
@@ -87,7 +88,9 @@ Keep the `engines/` folder next to the app (or set `CORVOX_ENGINES` to its path)
 2. **Engine** button: pick your language, install an engine, select it.
 3. Type, press Enter.
 
-About the clip: cloning models continue from the end of the clip, so Corvox feeds them the part of your recording that ends at a natural pause (up to 10 s) plus a little silence. With a clip that ended mid-word, the Turkish model invented extra words before reading the text (clarity 14%); cut at a pause, clarity was 95%. Pausing briefly at the end of your recording helps.
+About the clip: longer isn't better. With Pocket TTS Turkish, a 5–10 s clip matched the voice best (78–81%); 14 s and 19 s clips scored 74% and 68% and used more RAM. Corvox uses up to 10 s.
+
+Cloning models also continue from the end of the clip, so Corvox feeds them the part of your recording that ends at a natural pause (up to 10 s) plus a little silence. With a clip that ended mid-word, the Turkish model invented extra words before reading the text (clarity 14%); cut at a pause, clarity was 95%. Pausing briefly at the end of your recording helps.
 
 ## Discord tips
 
@@ -112,6 +115,7 @@ Debug switches (environment variables):
 - `CORVOX_SAY="text"`: speak this on startup
 - `CORVOX_SHOT=out.png` (+ `CORVOX_SHOT_PAGE=engines|voices|settings`, `CORVOX_SHOT_AFTER=<secs>`): save a screenshot and quit
 - `CORVOX_INSTALL=<env>`: start installing an engine environment on launch
+- `CORVOX_OFFSCREEN=1`: open off-screen without taking focus (for screenshots)
 - `CORVOX_THREADS=n`: CPU threads for Pocket engines (default 4)
 
 Run the helper by hand: `cd engines/pocket && uv run python -m corvox_engine --bench --model pocket-tr --language tr --voice my.wav`

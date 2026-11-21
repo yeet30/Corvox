@@ -148,6 +148,23 @@ pub fn wav_seconds(path: &Path) -> Option<f32> {
     Some(r.duration() as f32 / r.spec().sample_rate as f32)
 }
 
+/// A short, soft two-note chime for "engine ready".
+pub fn chime() -> (Vec<f32>, u32) {
+    let sr = 48_000u32;
+    let len = (sr as f32 * 0.7) as usize;
+    let mut out = vec![0.0f32; len];
+    for (start, freq) in [(0.0f32, 987.8f32), (0.12, 1318.5)] {
+        let s0 = (start * sr as f32) as usize;
+        for (i, o) in out.iter_mut().enumerate().skip(s0) {
+            let t = (i - s0) as f32 / sr as f32;
+            let env = (-t * 6.0).exp() * (t * 400.0).min(1.0); // quick attack, soft decay
+            let tone = (std::f32::consts::TAU * freq * t).sin() + 0.25 * (std::f32::consts::TAU * freq * 2.0 * t).sin();
+            *o += 0.16 * env * tone;
+        }
+    }
+    (out, sr)
+}
+
 // ---------- output devices ----------
 
 pub fn output_device_names() -> Vec<String> {
@@ -228,6 +245,9 @@ fn build<T: SizedSample + FromSample<f32>>(
 pub struct Player {
     mic: Option<Sink>,
     monitor: Option<Sink>,
+    /// Speakers for app sounds (the "ready" chime) when "hear yourself" is off.
+    local: Option<Sink>,
+    mic_name: Option<String>,
     pub error: Option<String>,
 }
 
@@ -250,7 +270,7 @@ impl Player {
         } else {
             None
         };
-        Self { mic, monitor, error }
+        Self { mic, monitor, local: None, mic_name: mic_device.map(String::from), error }
     }
 
     pub fn has_mic(&self) -> bool {
@@ -278,6 +298,16 @@ impl Player {
         for s in self.sinks() {
             let n = (seconds * s.rate as f32) as usize;
             s.queue.lock().unwrap().extend(std::iter::repeat_n(0.0, n));
+        }
+    }
+
+    /// Plays a sound only on your speakers/headphones, never into the virtual mic.
+    pub fn play_local(&mut self, samples: &[f32], sr: u32) {
+        if self.monitor.is_none() && self.local.is_none() && default_device_name() != self.mic_name {
+            self.local = cpal::default_host().default_output_device().and_then(|d| Sink::open(&d, 0.8).ok());
+        }
+        if let Some(s) = self.monitor.as_ref().or(self.local.as_ref()) {
+            s.queue.lock().unwrap().extend(resample(samples, sr, s.rate));
         }
     }
 

@@ -36,6 +36,8 @@ pub enum Event {
     Hotkey,
     VmicLine(String),
     VmicDone { code: i32 },
+    DeleteDone { engine: String, freed_mb: f32, error: Option<String> },
+    CacheCleaned { result: Result<String, String> },
 }
 
 pub type Tx = (Sender<Event>, eframe::egui::Context);
@@ -69,14 +71,85 @@ fn base_command(uv: &Path, engines: &Path, env: &str) -> Command {
     c
 }
 
+fn env_python(env: &str) -> PathBuf {
+    let dir = env_dir(env);
+    if cfg!(windows) {
+        dir.join("Scripts").join("python.exe")
+    } else {
+        dir.join("bin").join("python")
+    }
+}
+
+/// Runs the engine helper with the environment's own Python. Going through `uv run` meant
+/// stopping the helper only killed `uv`, and its Python child kept running (and downloading).
 fn python_command(uv: &Path, engines: &Path, env: &str, agreed: bool, int8: bool) -> Command {
-    let mut c = base_command(uv, engines, env);
+    let py = env_python(env);
+    let mut c = if py.is_file() {
+        let mut c = Command::new(&py);
+        c.env("VIRTUAL_ENV", env_dir(env))
+            .env("PYTHONUNBUFFERED", "1")
+            .env("PYTHONIOENCODING", "utf-8")
+            .current_dir(engines.join(env));
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            c.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+        }
+        c
+    } else {
+        let mut c = base_command(uv, engines, env);
+        c.args(["run", "--no-sync", "--project", "."]).arg("python");
+        c
+    };
+    c.args(["-m", "corvox_engine"]);
     c.env("CORVOX_QUANTIZE", if int8 { "1" } else { "0" }).env("HF_HUB_DISABLE_SYMLINKS_WARNING", "1");
-    c.args(["run", "--no-sync", "--project", "."]).args(["python", "-m", "corvox_engine"]);
     if agreed {
         c.env("COQUI_TOS_AGREED", "1");
     }
     c
+}
+
+/// A process and everything it starts (on Windows a venv's python.exe is a launcher that
+/// starts the real Python as a child). Dropping the group kills the whole tree, and so does
+/// Corvox exiting or crashing, since the OS closes the handle then.
+pub struct ProcGroup(#[cfg(windows)] isize);
+
+#[cfg(windows)]
+impl ProcGroup {
+    pub fn bind(child: &Child) -> Option<Self> {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::System::JobObjects::{
+            AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation, SetInformationJobObject,
+            JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+        };
+        unsafe {
+            let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+            if job.is_null() {
+                return None;
+            }
+            let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
+            info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            SetInformationJobObject(job, JobObjectExtendedLimitInformation, &info as *const _ as *const _, std::mem::size_of_val(&info) as u32);
+            AssignProcessToJobObject(job, child.as_raw_handle() as _);
+            Some(Self(job as isize))
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for ProcGroup {
+    fn drop(&mut self) {
+        unsafe {
+            windows_sys::Win32::Foundation::CloseHandle(self.0 as _);
+        }
+    }
+}
+
+#[cfg(not(windows))]
+impl ProcGroup {
+    pub fn bind(_child: &Child) -> Option<Self> {
+        Some(Self())
+    }
 }
 
 fn dir_size(p: &Path) -> u64 {
@@ -139,6 +212,7 @@ pub fn install(uv: PathBuf, engines: PathBuf, env: String, tx: Tx) -> CancelHand
                 return;
             }
         };
+        let _group = ProcGroup::bind(&child);
         let err = child.stderr.take().unwrap();
         let out = child.stdout.take();
         *handle.lock().unwrap() = Some(child);
@@ -182,6 +256,62 @@ pub fn cancel_install(h: &CancelHandle) {
     }
 }
 
+/// Deletes an engine's Python environment (if `remove_env`) and its model repos, including
+/// half-finished downloads. Runs in the background; reports how much space was freed.
+pub fn delete_engine_files(engine: String, env: Option<String>, repos: Vec<String>, tx: Tx) {
+    std::thread::spawn(move || {
+        // Give stopped helpers a moment to exit and release their files.
+        std::thread::sleep(std::time::Duration::from_millis(600));
+        let mut dirs: Vec<PathBuf> = repos
+            .iter()
+            .map(|r| crate::config::hf_hub_dir().join(format!("models--{}", r.replace('/', "--"))))
+            .collect();
+        if let Some(env) = &env {
+            dirs.push(env_dir(env));
+        }
+        let mut freed = 0u64;
+        let mut error = None;
+        for d in dirs.iter().filter(|d| d.exists()) {
+            let size = dir_size(d);
+            let mut last = Ok(());
+            for _ in 0..5 {
+                last = std::fs::remove_dir_all(d);
+                if last.is_ok() {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(500));
+            }
+            match last {
+                Ok(()) => freed += size,
+                Err(e) => error = Some(format!("{}: {e}", d.display())),
+            }
+        }
+        send(&tx, Event::DeleteDone { engine, freed_mb: freed as f32 / 1_048_576.0, error });
+    });
+}
+
+/// `uv cache clean`: removes uv's download cache. Installed engines keep working.
+pub fn clean_uv_cache(uv: PathBuf, tx: Tx) {
+    std::thread::spawn(move || {
+        let mut c = Command::new(&uv);
+        c.args(["cache", "clean"]).stdin(Stdio::null());
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            c.creation_flags(0x0800_0000);
+        }
+        let result = match c.output() {
+            Ok(o) if o.status.success() => {
+                let text = String::from_utf8_lossy(&o.stderr).to_string() + &String::from_utf8_lossy(&o.stdout);
+                Ok(text.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("").trim().to_string())
+            }
+            Ok(o) => Err(String::from_utf8_lossy(&o.stderr).lines().last().unwrap_or("uv cache clean failed").to_string()),
+            Err(e) => Err(e.to_string()),
+        };
+        send(&tx, Event::CacheCleaned { result });
+    });
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Kind {
     Load,
@@ -196,6 +326,7 @@ static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new
 pub struct Helper {
     pub env: String,
     child: Child,
+    group: Option<ProcGroup>,
     stdin: ChildStdin,
     pending: Arc<Mutex<HashMap<u64, (Kind, String)>>>,
 }
@@ -205,6 +336,7 @@ impl Helper {
         let mut c = python_command(uv, engines, env, agreed, int8);
         c.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
         let mut child = c.spawn()?;
+        let group = ProcGroup::bind(&child);
         let stdin = child.stdin.take().unwrap();
         let stdout = child.stdout.take().unwrap();
         let stderr = child.stderr.take().unwrap();
@@ -244,7 +376,7 @@ impl Helper {
             send(&tx, Event::HelperExited { key: key_name, msg: last });
         });
 
-        Ok(Self { env: env.to_string(), child, stdin, pending })
+        Ok(Self { env: env.to_string(), child, group, stdin, pending })
     }
 
     fn request(&mut self, kind: Kind, model: &str, mut body: Value) -> anyhow::Result<u64> {
@@ -292,8 +424,9 @@ impl Drop for Helper {
     fn drop(&mut self) {
         let _ = writeln!(self.stdin, "{}", json!({"cmd": "quit", "id": 0}));
         let _ = self.stdin.flush();
-        std::thread::sleep(std::time::Duration::from_millis(100));
+        self.group = None; // closing the job kills the launcher and the real Python under it
         let _ = self.child.kill();
+        let _ = self.child.wait();
     }
 }
 
@@ -359,6 +492,7 @@ pub fn bench(uv: PathBuf, engines: PathBuf, env: String, model: String, voice: P
                 return;
             }
         };
+        let _group = ProcGroup::bind(&child);
         let stderr = child.stderr.take().unwrap();
         let tail = std::thread::spawn(move || {
             let mut last = String::new();

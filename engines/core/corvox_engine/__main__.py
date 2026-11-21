@@ -15,6 +15,7 @@ import numpy as np
 
 from .adapters.base import prepare_reference
 from .downloads import DownloadWatch
+from .postprocess import EdgeTrimmer
 from .protocol import log, pcm16_b64, read_requests, send
 from .registry import make_adapter
 from .stats import mem_stats
@@ -48,21 +49,30 @@ class Server:
         self.stop.clear()
         self.speaking_id = rid
         total, buf, buf_sr = 0.0, [], 24000
+        trimmer = None
+
+        def flush(force: bool = False) -> None:
+            nonlocal buf, total
+            n = sum(len(b) for b in buf)
+            if n and (force or n / buf_sr >= CHUNK_SECONDS):
+                out = np.concatenate(buf)
+                buf = []
+                total += len(out) / buf_sr
+                send({"event": "chunk", "id": rid, "sample_rate": buf_sr, "pcm16": pcm16_b64(out)})
+
         try:
             for audio, sr in ad.synth_stream(req["text"], voice, req.get("language", "en"), self.stop):
                 if self.stop.is_set():
                     break
-                buf.append(audio)
-                buf_sr = sr
-                if sum(len(b) for b in buf) / sr >= CHUNK_SECONDS:
-                    out = np.concatenate(buf)
-                    buf = []
-                    total += len(out) / sr
-                    send({"event": "chunk", "id": rid, "sample_rate": sr, "pcm16": pcm16_b64(out)})
-            if buf and not self.stop.is_set():
-                out = np.concatenate(buf)
-                total += len(out) / buf_sr
-                send({"event": "chunk", "id": rid, "sample_rate": buf_sr, "pcm16": pcm16_b64(out)})
+                if trimmer is None:
+                    trimmer, buf_sr = EdgeTrimmer(sr), sr
+                ready = trimmer.push(audio)
+                if len(ready):
+                    buf.append(ready)
+                    flush()
+            if trimmer is not None and not self.stop.is_set():
+                buf.append(trimmer.finish())
+                flush(force=True)
         finally:
             self.speaking_id = None
         send({"id": rid, "ok": True, "seconds": round(total, 2), "cancelled": self.stop.is_set()})

@@ -170,6 +170,10 @@ impl Config {
         self.downloaded.iter().any(|d| d == key)
     }
 
+    pub fn forget_downloaded(&mut self, pred: impl Fn(&str) -> bool) {
+        self.downloaded.retain(|d| !pred(d));
+    }
+
     pub fn mark_downloaded(&mut self, key: &str) {
         if !self.is_downloaded(key) {
             self.downloaded.push(key.to_string());
@@ -189,6 +193,17 @@ impl Config {
         let p = voices_dir().join(format!("{v}.wav"));
         p.exists().then_some(p)
     }
+}
+
+/// Hugging Face's model cache (respects HF_HUB_CACHE / HF_HOME like huggingface_hub does).
+pub fn hf_hub_dir() -> PathBuf {
+    if let Some(p) = std::env::var_os("HF_HUB_CACHE") {
+        return PathBuf::from(p);
+    }
+    let home = std::env::var_os("HF_HOME").map(PathBuf::from).unwrap_or_else(|| {
+        directories::BaseDirs::new().map(|b| b.home_dir().join(".cache").join("huggingface")).unwrap_or_default()
+    });
+    home.join("hub")
 }
 
 /// Where replayable audio of recent phrases is kept.

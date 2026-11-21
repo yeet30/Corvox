@@ -45,6 +45,9 @@ pub struct Engine {
     /// Kyutai ships one model per language, so "downloaded" is tracked per language.
     #[serde(default)]
     pub per_language_models: bool,
+    /// Hugging Face repos the engine downloads its model from (deleted with the engine).
+    #[serde(default)]
+    pub hf_repos: Vec<String>,
 }
 
 impl Engine {

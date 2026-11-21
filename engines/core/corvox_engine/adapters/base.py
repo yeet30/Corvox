@@ -37,11 +37,17 @@ class Adapter:
         """Optional: precompute whatever the model needs from the voice clip."""
 
     def synth_stream(self, text: str, voice_path: str, language: str, stop):
-        """Yield (samples, sample_rate) pieces as they're ready. Default: one sentence at a time."""
+        """Yield (samples, sample_rate) pieces as they're ready. Default: one sentence at a time,
+        each with its own edges cleaned (noises can appear between sentences too)."""
+        from ..postprocess import EdgeTrimmer
+
         for sentence in split_sentences(text):
             if stop.is_set():
                 return
-            yield self.synth(sentence, voice_path, language)
+            audio, sr = self.synth(sentence, voice_path, language)
+            t = EdgeTrimmer(sr)
+            cleaned = np.concatenate([t.push(audio), t.finish()])
+            yield cleaned, sr
 
 
 def read_wav_mono(path: str) -> tuple[np.ndarray, int]:
