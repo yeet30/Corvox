@@ -29,6 +29,22 @@ mod imp {
             }
         }
 
+        /// The usable area (without the taskbar) of the monitor the window is on, in physical
+        /// pixels: (left, top, right, bottom).
+        pub fn work_area(&self) -> Option<(i32, i32, i32, i32)> {
+            use windows_sys::Win32::Graphics::Gdi::{GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST};
+            unsafe {
+                let mon = MonitorFromWindow(self.0, MONITOR_DEFAULTTONEAREST);
+                let mut info: MONITORINFO = std::mem::zeroed();
+                info.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
+                if GetMonitorInfoW(mon, &mut info) == 0 {
+                    return None;
+                }
+                let r = info.rcWork;
+                Some((r.left, r.top, r.right, r.bottom))
+            }
+        }
+
         pub fn round_corners(&self) {
             let pref = DWMWCP_ROUND;
             unsafe {
@@ -107,6 +123,9 @@ mod imp {
             None
         }
         pub fn round_corners(&self) {}
+        pub fn work_area(&self) -> Option<(i32, i32, i32, i32)> {
+            None
+        }
         pub fn track_previous(&self) -> std::sync::Arc<std::sync::atomic::AtomicIsize> {
             Default::default()
         }
@@ -130,4 +149,24 @@ pub use imp::Window;
 /// True when the OS draws rounded corners for us (Windows 11), so we paint square ones.
 pub fn native_corners() -> bool {
     cfg!(windows)
+}
+
+/// Waits (up to `ms`) for the process `pid` to exit. Used after an update, so the new version
+/// opens once the old one has let go of the shortcut and the audio devices.
+#[cfg(windows)]
+pub fn wait_for_exit(pid: u32, ms: u32) {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::{OpenProcess, WaitForSingleObject, PROCESS_SYNCHRONIZE};
+    unsafe {
+        let h = OpenProcess(PROCESS_SYNCHRONIZE, 0, pid);
+        if !h.is_null() {
+            WaitForSingleObject(h, ms);
+            CloseHandle(h);
+        }
+    }
+}
+
+#[cfg(not(windows))]
+pub fn wait_for_exit(_pid: u32, ms: u32) {
+    std::thread::sleep(std::time::Duration::from_millis(ms.min(1500) as u64));
 }

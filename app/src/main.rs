@@ -9,11 +9,17 @@ mod i18n;
 mod icons;
 mod platform;
 mod ptt;
+mod update;
 mod vmic;
 
 use eframe::egui;
 
 fn main() -> eframe::Result {
+    update::init();
+    if let Some(pid) = update::wait_pid_arg() {
+        platform::wait_for_exit(pid, 10_000); // restarted after an update: let the old one close
+    }
+    update::cleanup();
     let cfg = config::Config::load();
     let size = if cfg.collapsed { app::COLLAPSED } else { app::EXPANDED };
     let mut viewport = egui::ViewportBuilder::default()

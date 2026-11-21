@@ -7,12 +7,13 @@ use eframe::egui::{self, Align, Color32, CornerRadius, FontId, Key, Layout, Rich
 
 use crate::audio::{self, Player};
 use crate::catalog::{find_engines_dir, find_uv, Catalog, Engine};
-use crate::config::{self, Config};
+use crate::config::{self, Config, Corner};
 use crate::engine::{self, CancelHandle, Event, Helper, Tx};
 use crate::i18n::{self, t, tf};
 use crate::icons::{self, Icon};
 use crate::platform;
 use crate::ptt::{self, Ptt};
+use crate::update;
 use crate::vmic;
 
 pub const APP_NAME: &str = "Corvox";
@@ -65,6 +66,18 @@ impl Msg {
     }
 }
 
+/// Where the update check / install stands.
+#[derive(Clone, PartialEq)]
+enum Upd {
+    Idle,
+    Checking,
+    UpToDate,
+    Available(update::Release),
+    Downloading { version: String, done: u64, total: u64 },
+    Restarting,
+    Failed(Msg),
+}
+
 #[derive(Clone, PartialEq)]
 enum Status {
     Ready,
@@ -104,7 +117,17 @@ struct Hs {
     /// Loaded models on this helper: model key -> device ("cpu"/"cuda").
     loaded: HashMap<String, String>,
     loading: Option<String>,
+    /// Loaded model keys, oldest first (up to two stay loaded).
+    order: Vec<String>,
+    /// When this helper became the spare (the previous engine, kept warm for quick switches).
+    idle_since: Option<Instant>,
+    models_freed: bool,
 }
+
+/// The previous engine stays loaded this long after a switch, then frees its model...
+const SPARE_MODEL_SECS: u64 = 180;
+/// ...and its process this long after the switch.
+const SPARE_PROCESS_SECS: u64 = 600;
 
 /// A background model download: which engine/language it is for.
 #[derive(Clone)]
@@ -137,6 +160,8 @@ pub struct App {
     /// Key of the helper that speaks. Every helper gets a fresh key, so a late "exited"
     /// event from a replaced helper can't be mistaken for the new one.
     main_key: String,
+    /// The previously used engine's helper, kept running so switching back is instant.
+    spare_key: Option<String>,
     helper_gen: u64,
     downloads: HashMap<String, Download>,
     paused_downloads: HashMap<String, f32>,
@@ -182,6 +207,14 @@ pub struct App {
     win: Option<platform::Window>,
     prev_window: Option<std::sync::Arc<std::sync::atomic::AtomicIsize>>,
     scroll_to: Option<String>,
+    /// Re-apply the corner snap once the first frame knows the screen scale.
+    snap_pending: bool,
+    upd: Upd,
+    /// Running from a release folder we can write to, so updates can install themselves.
+    self_update_ok: bool,
+    /// Installed engine environments whose packages are being brought up to date after an
+    /// app update.
+    resyncing: HashSet<String>,
 }
 
 impl App {
@@ -220,6 +253,7 @@ impl App {
             tx,
             helpers: HashMap::new(),
             main_key: String::new(),
+            spare_key: None,
             helper_gen: 0,
             downloads: HashMap::new(),
             paused_downloads: HashMap::new(),
@@ -260,6 +294,10 @@ impl App {
             win: platform::Window::from(cc),
             prev_window: None,
             scroll_to: None,
+            snap_pending: true,
+            upd: Upd::Idle,
+            self_update_ok: update::can_self_update(),
+            resyncing: HashSet::new(),
         };
         if app.cfg.voice.as_ref().map(|v| !app.voices.contains(v)).unwrap_or(true) {
             app.cfg.voice = app.voices.first().cloned();
@@ -274,7 +312,11 @@ impl App {
         app.tidy_phrase_cache();
         app.apply_hotkey();
         app.fix_engine_for_language();
+        app.resync_outdated();
         app.ensure_main();
+        if app.cfg.check_updates && std::env::var_os("CORVOX_SHOT").is_none() {
+            update::check(app.tx.clone(), false);
+        }
         if let Ok(t) = std::env::var("CORVOX_SAY") {
             app.speak(t); // debug: speak on startup
         }
@@ -352,7 +394,10 @@ impl App {
         let (Some(uv), Some(dir)) = (self.uv.clone(), self.engines_dir.clone()) else { return false };
         match Helper::spawn(&uv, &dir, &e.env, key, self.agreed(&e.id), self.cfg.int8, self.tx.clone()) {
             Ok(h) => {
-                self.helpers.insert(key.to_string(), Hs { h, ready: false, loaded: HashMap::new(), loading: None });
+                self.helpers.insert(
+                    key.to_string(),
+                    Hs { h, ready: false, loaded: HashMap::new(), loading: None, order: vec![], idle_since: None, models_freed: false },
+                );
                 true
             }
             Err(err) => {
@@ -369,6 +414,9 @@ impl App {
             self.helpers.remove(&self.main_key);
             return;
         }
+        if self.resyncing.contains(&e.env) {
+            return; // its packages are being updated; it starts when that's done
+        }
         let alive = self.helpers.get_mut(&self.main_key).map(|hs| hs.h.env == e.env && hs.h.is_alive()).unwrap_or(false);
         if alive {
             if self.helpers.get(&self.main_key).map(|hs| hs.ready).unwrap_or(false) {
@@ -376,11 +424,75 @@ impl App {
             }
             return;
         }
-        self.helpers.remove(&self.main_key);
+        // Switching back to the previous engine: its helper is still running (and usually
+        // still has the model loaded), so just swap the two.
+        if let Some(sk) = self.spare_key.clone() {
+            let spare_ok = self.helpers.get_mut(&sk).map(|hs| hs.h.env == e.env && hs.h.is_alive()).unwrap_or(false);
+            if spare_ok {
+                let old = std::mem::replace(&mut self.main_key, sk.clone());
+                self.spare_key = None;
+                if let Some(hs) = self.helpers.get_mut(&sk) {
+                    hs.idle_since = None;
+                    hs.models_freed = false;
+                }
+                self.park_as_spare(old);
+                if self.helpers.get(&self.main_key).map(|hs| hs.ready).unwrap_or(false) {
+                    self.preload(false);
+                } else {
+                    self.status = Status::StartingEngine;
+                }
+                return;
+            }
+        }
+        let old = std::mem::take(&mut self.main_key);
+        self.park_as_spare(old);
         let key = self.next_key("main");
         if self.spawn_helper(&key, &e) {
             self.main_key = key;
             self.status = Status::StartingEngine;
+        }
+    }
+
+    /// Keeps a helper we're switching away from running as the spare (replacing any older one).
+    fn park_as_spare(&mut self, key: String) {
+        if key.is_empty() || !self.helpers.contains_key(&key) {
+            return;
+        }
+        if let Some(old) = self.spare_key.take() {
+            self.helpers.remove(&old);
+        }
+        if let Some(hs) = self.helpers.get_mut(&key) {
+            hs.idle_since = Some(Instant::now());
+            hs.models_freed = false;
+        }
+        self.spare_key = Some(key);
+    }
+
+    /// Frees the spare's model after a while, then the spare itself.
+    fn tend_spare(&mut self) {
+        let Some(sk) = self.spare_key.clone() else { return };
+        let Some(hs) = self.helpers.get_mut(&sk) else {
+            self.spare_key = None;
+            return;
+        };
+        let idle = hs.idle_since.map(|t| t.elapsed().as_secs()).unwrap_or(0);
+        if idle >= SPARE_PROCESS_SECS {
+            self.helpers.remove(&sk);
+            self.spare_key = None;
+        } else if idle >= SPARE_MODEL_SECS && !hs.models_freed {
+            let ids: HashSet<String> = hs.loaded.keys().map(|k| k.split(':').next().unwrap_or(k).to_string()).collect();
+            for id in ids {
+                hs.h.unload(&id);
+            }
+            hs.loaded.clear();
+            hs.order.clear();
+            hs.models_freed = true;
+        }
+    }
+
+    fn drop_spare(&mut self) {
+        if let Some(sk) = self.spare_key.take() {
+            self.helpers.remove(&sk);
         }
     }
 
@@ -395,7 +507,9 @@ impl App {
     }
 
     fn restart_main(&mut self) {
+        self.drop_spare();
         self.helpers.remove(&self.main_key);
+        self.main_key.clear();
         self.ensure_main();
     }
 
@@ -413,12 +527,19 @@ impl App {
         let voice = self.cfg.voice_path();
         let Some(hs) = self.helpers.get_mut(&self.main_key) else { return };
         if !force && (hs.loaded.contains_key(&key) || hs.loading.as_deref() == Some(key.as_str())) {
+            hs.order.retain(|k| *k != key);
+            hs.order.push(key.clone());
             return;
         }
-        let stale: Vec<String> = hs.loaded.keys().filter(|k| **k != key).cloned().collect();
-        for k in stale {
-            hs.h.unload(k.split(':').next().unwrap_or(&k));
-            hs.loaded.remove(&k);
+        // Keep the two most recent models loaded so switching between them is instant.
+        if !hs.loaded.contains_key(&key) && hs.loaded.len() >= 2 {
+            if let Some(oldest) = hs.order.iter().find(|k| **k != key).cloned() {
+                let id = oldest.split(':').next().unwrap_or(&oldest).to_string();
+                hs.h.unload(&id);
+                let prefix = format!("{id}:");
+                hs.loaded.retain(|k, _| *k != id && !k.starts_with(&prefix));
+                hs.order.retain(|k| *k != id && !k.starts_with(&prefix));
+            }
         }
         if hs.h.load(&e.id, &lang, voice.as_deref(), e.model_mb).is_ok() {
             hs.loading = Some(key);
@@ -517,6 +638,11 @@ impl App {
         // Stop everything that uses these files first.
         if self.helpers.get(&self.main_key).map(|h| h.h.env == e.env).unwrap_or(false) {
             self.helpers.remove(&self.main_key);
+        }
+        if let Some(sk) = self.spare_key.clone() {
+            if self.helpers.get(&sk).map(|h| h.h.env == e.env).unwrap_or(true) {
+                self.drop_spare();
+            }
         }
         let dl_keys: Vec<String> = self
             .downloads
@@ -724,7 +850,77 @@ impl App {
         self.cfg.save();
         let size = if expanded { EXPANDED } else { COLLAPSED };
         self.tx.1.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
+        if let Some(c) = self.cfg.snap {
+            self.snap_to(c, size); // grow/shrink in place, staying in the corner
+        }
         self.focus_text = true;
+    }
+
+    /// Moves the window into a corner of its screen's usable area (taskbar excluded).
+    fn snap_to(&mut self, corner: Corner, size: Vec2) {
+        let ctx = self.tx.1.clone();
+        let ppp = ctx.pixels_per_point();
+        let area = self.win.and_then(|w| w.work_area()).map(|(l, t, r, b)| (l as f32, t as f32, r as f32, b as f32)).or_else(|| {
+            ctx.input(|i| i.viewport().monitor_size).map(|m| (0.0, 0.0, m.x * ppp, m.y * ppp))
+        });
+        let Some((l, t, r, b)) = area else { return };
+        let margin = 12.0 * ppp;
+        let (w, h) = (size.x * ppp, size.y * ppp);
+        let x = if corner.left() { l + margin } else { r - w - margin };
+        let y = if corner.top() { t + margin } else { b - h - margin };
+        ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(x / ppp, y / ppp)));
+    }
+
+    fn set_snap(&mut self, corner: Option<Corner>) {
+        self.cfg.snap = corner;
+        self.cfg.save();
+        if let Some(c) = corner {
+            let size = if self.cfg.collapsed { COLLAPSED } else { EXPANDED };
+            self.snap_to(c, size);
+        }
+    }
+
+    /// Four arrows from the center to the corners, their 90° tips outlining a square.
+    /// Clicking the arrow toward a corner sticks the window there; clicking it again unsticks.
+    fn snap_widget(&mut self, ui: &mut egui::Ui) {
+        let (rect, resp) = ui.allocate_exact_size(Vec2::splat(22.0), Sense::click());
+        let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text(t("Stick to a corner: click the arrow toward it. Click it again to unstick."));
+        let c = rect.center();
+        let corner_at = |p: egui::Pos2| match (p.x < c.x, p.y < c.y) {
+            (true, true) => Corner::TopLeft,
+            (false, true) => Corner::TopRight,
+            (true, false) => Corner::BottomLeft,
+            (false, false) => Corner::BottomRight,
+        };
+        let hovered = resp.hover_pos().map(corner_at);
+        let accent = ui.visuals().selection.stroke.color;
+        let normal = ui.visuals().widgets.inactive.fg_stroke.color;
+        let strong = ui.visuals().strong_text_color();
+        let painter = ui.painter_at(rect);
+        let reach = 8.0;
+        let leg = 4.5;
+        for corner in Corner::ALL {
+            let sx = if corner.left() { -1.0 } else { 1.0 };
+            let sy = if corner.top() { -1.0 } else { 1.0 };
+            let (color, width) = if self.cfg.snap == Some(corner) {
+                (accent, 2.0)
+            } else if hovered == Some(corner) {
+                (strong, 1.7)
+            } else {
+                (normal, 1.4)
+            };
+            let stroke = Stroke::new(width, color);
+            let tip = c + Vec2::new(sx * reach, sy * reach);
+            painter.line_segment([c + Vec2::new(sx * 2.0, sy * 2.0), tip], stroke);
+            painter.line_segment([tip, tip - Vec2::new(sx * leg, 0.0)], stroke);
+            painter.line_segment([tip, tip - Vec2::new(0.0, sy * leg)], stroke);
+        }
+        if resp.clicked() {
+            if let Some(corner) = resp.interact_pointer_pos().map(corner_at) {
+                let next = if self.cfg.snap == Some(corner) { None } else { Some(corner) };
+                self.set_snap(next);
+            }
+        }
     }
 
     fn set_on_top(&mut self, on: bool) {
@@ -838,6 +1034,11 @@ impl App {
                     }
                 }
                 Event::HelperExited { key, msg } => {
+                    if self.spare_key.as_deref() == Some(key.as_str()) {
+                        self.spare_key = None;
+                        self.helpers.remove(&key);
+                        continue;
+                    }
                     if key == self.main_key {
                         if self.helpers.remove(&self.main_key).is_some() {
                             self.error = Some(Msg::new("Engine stopped. {}", &[&msg]));
@@ -877,6 +1078,8 @@ impl App {
                             Ok(dev) => {
                                 if let Some(mk) = mk {
                                     hs.loaded.insert(mk.clone(), dev);
+                                    hs.order.retain(|k| *k != mk);
+                                    hs.order.push(mk.clone());
                                     self.model_dl.remove(&mk);
                                     self.cfg.mark_downloaded(&mk);
                                     self.cfg.save();
@@ -962,7 +1165,16 @@ impl App {
                 }
                 Event::InstallDone { env, ok, cancelled } => {
                     let inst = self.installs.remove(&env);
-                    if ok {
+                    if self.resyncing.remove(&env) {
+                        // Packages brought up to date after an app update. If that failed
+                        // (offline?), the old ones usually still work: start anyway and try
+                        // again next time.
+                        if !ok && !cancelled {
+                            let line = inst.map(|i| i.line).unwrap_or_default();
+                            self.error = Some(Msg::new("Couldn't update the engine's packages: {}", &[&line]));
+                        }
+                        self.ensure_main();
+                    } else if ok {
                         self.paused_installs.remove(&env);
                         self.status = Status::Ready;
                         self.after_install(&env);
@@ -1023,6 +1235,36 @@ impl App {
                         Err(e) => Msg::new("Couldn't clear the cache: {}", &[&e]),
                     });
                 }
+                Event::UpdateChecked { result, manual } => {
+                    if matches!(self.upd, Upd::Downloading { .. } | Upd::Restarting) {
+                        continue;
+                    }
+                    self.upd = match result {
+                        Ok(Some(r)) => Upd::Available(r),
+                        Ok(None) if manual => Upd::UpToDate,
+                        Err(e) if manual => Upd::Failed(Msg::new("Couldn't check for updates: {}", &[&e])),
+                        _ => Upd::Idle, // the quiet check at startup only speaks up when there's news
+                    };
+                }
+                Event::UpdateProgress { done: d, total: tot } => {
+                    if let Upd::Downloading { done, total, .. } = &mut self.upd {
+                        *done = d;
+                        *total = tot;
+                    }
+                }
+                Event::UpdateDone { result } => match result {
+                    Ok(()) => match update::restart() {
+                        Ok(()) => {
+                            self.upd = Upd::Restarting;
+                            self.tx.1.send_viewport_cmd(egui::ViewportCommand::Close);
+                        }
+                        Err(e) => self.upd = Upd::Failed(Msg::new("Updated, but couldn't restart ({}). Start Corvox again.", &[&e])),
+                    },
+                    Err(e) => {
+                        self.upd = Upd::Failed(Msg::new("Update failed: {}", &[&e]));
+                        self.ensure_main(); // the engine was stopped for the update
+                    }
+                },
             }
         }
     }
@@ -1057,6 +1299,9 @@ impl App {
         let drag = ui.interact(rect, ui.scope_id().with("titlebar"), Sense::click_and_drag());
         if drag.drag_started() {
             ui.ctx().send_viewport_cmd(egui::ViewportCommand::StartDrag);
+            if self.cfg.snap.is_some() {
+                self.set_snap(None); // moved by hand: no longer stuck to a corner
+            }
         }
         ui.scope_builder(UiBuilder::new().max_rect(rect).layout(Layout::left_to_right(Align::Center)), |ui| {
             icons::small(ui, Icon::Mic, ui.visuals().text_color());
@@ -1082,6 +1327,17 @@ impl App {
                 let st_tint = if self.page == Page::Settings { ui.visuals().selection.stroke.color } else { ui.visuals().widgets.inactive.fg_stroke.color };
                 if icons::button_tinted(ui, Icon::Sliders, st_tint, t("Settings")).clicked() {
                     self.page = if self.page == Page::Settings { Page::Main } else { Page::Settings };
+                }
+                let news = match &self.upd {
+                    Upd::Available(r) => Some(r.version.clone()),
+                    Upd::Downloading { version, .. } => Some(version.clone()),
+                    _ => None,
+                };
+                if let Some(v) = news {
+                    let accent = ui.visuals().selection.stroke.color;
+                    if icons::button_tinted(ui, Icon::Download, accent, &tf("Corvox {} is available", &[&v])).clicked() {
+                        self.page = Page::Settings;
+                    }
                 }
             });
         });
@@ -1166,6 +1422,9 @@ impl App {
         }
         if let Some(env) = self.installs.keys().next() {
             let name = self.catalog.as_ref().and_then(|c| c.engines.iter().find(|e| &e.env == env)).map(|e| short_name(&e.name)).unwrap_or_default();
+            if self.resyncing.contains(env) {
+                return tf("Updating {} packages…", &[&name]);
+            }
             return tf("Installing {}…", &[&name]);
         }
         self.status.text()
@@ -1726,6 +1985,104 @@ impl App {
         });
     }
 
+    /// After an app update, engines whose package list changed get their packages brought up
+    /// to date before they start (quick when little changed).
+    fn resync_outdated(&mut self) {
+        let (Some(cat), Some(dir)) = (self.catalog.clone(), self.engines_dir.clone()) else { return };
+        let envs: HashSet<String> = cat.engines.iter().map(|e| e.env.clone()).collect();
+        for env in envs {
+            if self.uv.is_some() && engine::is_installed(&env) && engine::is_outdated(&dir, &env) && !self.installs.contains_key(&env) {
+                self.resyncing.insert(env.clone());
+                self.start_install(&env);
+            }
+        }
+    }
+
+    fn updates_section(&mut self, ui: &mut egui::Ui) {
+        ui.label(RichText::new(t("Updates")).small().weak());
+        let busy = matches!(self.upd, Upd::Checking | Upd::Downloading { .. } | Upd::Restarting);
+        ui.horizontal(|ui| {
+            ui.label(RichText::new(tf("Version {}", &[update::VERSION])).small());
+            match &self.upd {
+                Upd::Checking => {
+                    ui.spinner();
+                }
+                Upd::UpToDate => {
+                    ui.label(RichText::new(t("Up to date")).small().color(GREEN));
+                }
+                _ => {}
+            }
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if ui.add_enabled(!busy, egui::Button::new(RichText::new(t("Check now")).small())).clicked() {
+                    self.upd = Upd::Checking;
+                    update::check(self.tx.clone(), true);
+                }
+            });
+        });
+        match self.upd.clone() {
+            Upd::Available(r) => {
+                let accent = ui.visuals().selection.stroke.color;
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(RichText::new(tf("Corvox {} is available", &[&r.version])).small().color(accent));
+                    if r.asset.is_some() && self.self_update_ok {
+                        let blocked = !self.benching.is_empty() || !self.deleting.is_empty() || self.cleaning_cache;
+                        let resp = ui.add_enabled_ui(!blocked, |ui| icons::labeled(ui, Icon::Download, t("Update and restart"))).inner;
+                        if resp.on_disabled_hover_text(t("Wait for the running task to finish")).clicked() {
+                            self.start_update(r.clone());
+                        }
+                    }
+                    ui.hyperlink_to(RichText::new(t("Release page")).small(), &r.page);
+                });
+                let note = if r.asset.is_none() {
+                    Some(t("That release has no download for this system yet."))
+                } else if !self.self_update_ok {
+                    Some(t("This copy can't update itself (it isn't a release folder, or Corvox can't write there). Get the new version from the release page."))
+                } else {
+                    None
+                };
+                if let Some(n) = note {
+                    ui.label(RichText::new(n).small().weak());
+                }
+            }
+            Upd::Downloading { version, done, total } => {
+                let frac = if total > 0 { done as f32 / total as f32 } else { 0.0 };
+                let text = tf("Downloading Corvox {}: {} of {}", &[&version, &fmt_mb(done as f32 / 1_048_576.0), &fmt_mb(total as f32 / 1_048_576.0)]);
+                ui.add(egui::ProgressBar::new(frac).desired_height(12.0).text(RichText::new(text).small()));
+            }
+            Upd::Restarting => {
+                ui.label(RichText::new(t("Restarting…")).small());
+            }
+            Upd::Failed(m) => {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(RichText::new(m.text()).small().color(RED));
+                    ui.hyperlink_to(RichText::new(t("Release page")).small(), update::releases_page());
+                });
+            }
+            _ => {}
+        }
+        if ui.checkbox(&mut self.cfg.check_updates, RichText::new(t("Check for updates when Corvox starts")).small()).changed() {
+            self.cfg.save();
+        }
+    }
+
+    /// Stops everything running from the app folder (so its files can be replaced), then
+    /// downloads and installs the release in the background.
+    fn start_update(&mut self, r: update::Release) {
+        let Some(asset) = r.asset.clone() else { return };
+        self.stop();
+        self.helpers.clear();
+        self.main_key.clear();
+        self.spare_key = None;
+        self.downloads.clear();
+        for (_, inst) in self.installs.drain() {
+            engine::cancel_install(&inst.handle);
+        }
+        self.resyncing.clear();
+        self.cfg.save();
+        self.upd = Upd::Downloading { version: r.version.clone(), done: 0, total: asset.size };
+        update::apply(asset, self.tx.clone());
+    }
+
     fn start_install(&mut self, env: &str) {
         let (Some(uv), Some(dir)) = (self.uv.clone(), self.engines_dir.clone()) else { return };
         let handle = engine::install(uv, dir, env.to_string(), self.tx.clone());
@@ -1807,6 +2164,9 @@ impl App {
         self.back_header(ui, t("Settings"));
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
             ui.add_space(4.0);
+            self.updates_section(ui);
+
+            ui.add_space(8.0);
             ui.label(RichText::new(t("Interface language")).small().weak());
             let before = self.cfg.ui_lang.clone();
             egui::ComboBox::from_id_salt("ui_lang").selected_text(if self.cfg.ui_lang == "tr" { "Türkçe" } else { "English" }).show_ui(ui, |ui| {
@@ -1991,6 +2351,9 @@ impl App {
         let drag = ui.interact(all, ui.scope_id().with("bar-drag"), Sense::click_and_drag());
         if drag.drag_started() {
             ui.ctx().send_viewport_cmd(egui::ViewportCommand::StartDrag);
+            if self.cfg.snap.is_some() {
+                self.set_snap(None);
+            }
         }
         ui.horizontal_centered(|ui| {
             let tint = if self.busy() { AMBER } else { ui.visuals().weak_text_color() };
@@ -1999,7 +2362,7 @@ impl App {
                 Some(p) => tf("Downloading {}", &[&p]),
                 None => format!("{} · {}", self.cfg.language.to_uppercase(), self.engine().map(|e| short_name(&e.name)).unwrap_or_default()),
             };
-            let w = ui.available_width() - 70.0 - tag.chars().count() as f32 * 6.2;
+            let w = ui.available_width() - 98.0 - tag.chars().count() as f32 * 6.2;
             self.text_box(ui, w.max(110.0));
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 if self.busy() {
@@ -2014,6 +2377,7 @@ impl App {
                 if icons::button(ui, Icon::ChevronUp, t("Expand")).clicked() {
                     self.expand(true);
                 }
+                self.snap_widget(ui);
                 let col = if self.error.is_some() { RED } else { ui.visuals().weak_text_color() };
                 let r = ui.label(RichText::new(tag).small().color(col));
                 if let Some(e) = &self.error {
@@ -2055,13 +2419,24 @@ impl eframe::App for App {
         [0.0, 0.0, 0.0, 0.0]
     }
 
-    fn logic(&mut self, _ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.handle_events();
+        self.tend_spare();
+        if self.spare_key.is_some() {
+            ctx.request_repaint_after(Duration::from_secs(5));
+        }
         self.update_ptt();
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.debug_screenshot(ui.ctx());
+        if self.snap_pending {
+            self.snap_pending = false;
+            if let Some(c) = self.cfg.snap {
+                let size = if self.cfg.collapsed { COLLAPSED } else { EXPANDED };
+                self.snap_to(c, size);
+            }
+        }
         let starting = self.helpers.values().any(|h| !h.ready);
         let active = self.busy()
             || !self.installs.is_empty()

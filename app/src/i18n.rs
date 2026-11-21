@@ -317,6 +317,29 @@ fn tr(en: &str) -> Option<&'static str> {
         "Wait for installs to finish" => "Kurulumların bitmesini bekle",
         "Download cache cleared. {}" => "İndirme önbelleği temizlendi. {}",
         "Couldn't clear the cache: {}" => "Önbellek temizlenemedi: {}",
+        "Updates" => "Güncellemeler",
+        "Version {}" => "Sürüm {}",
+        "Up to date" => "Güncel",
+        "Check now" => "Şimdi denetle",
+        "Corvox {} is available" => "Corvox {} çıktı",
+        "Update and restart" => "Güncelle ve yeniden başlat",
+        "Wait for the running task to finish" => "Süren işin bitmesini bekle",
+        "Release page" => "Sürüm sayfası",
+        "That release has no download for this system yet." => "Bu sürümde bu sistem için henüz indirme yok.",
+        "This copy can't update itself (it isn't a release folder, or Corvox can't write there). Get the new version from the release page." => {
+            "Bu kopya kendini güncelleyemiyor (sürüm klasörü değil ya da Corvox oraya yazamıyor). Yeni sürümü sürüm sayfasından indir."
+        }
+        "Downloading Corvox {}: {} of {}" => "Corvox {} indiriliyor: {} / {}",
+        "Restarting…" => "Yeniden başlatılıyor…",
+        "Check for updates when Corvox starts" => "Corvox açılınca güncellemeleri denetle",
+        "Couldn't check for updates: {}" => "Güncellemeler denetlenemedi: {}",
+        "Updated, but couldn't restart ({}). Start Corvox again." => "Güncellendi ama yeniden başlatılamadı ({}). Corvox'u yeniden aç.",
+        "Update failed: {}" => "Güncelleme başarısız: {}",
+        "Updating {} packages…" => "{} paketleri güncelleniyor…",
+        "Couldn't update the engine's packages: {}" => "Motorun paketleri güncellenemedi: {}",
+        "Stick to a corner: click the arrow toward it. Click it again to unstick." => {
+            "Bir köşeye sabitle: o köşeyi gösteren oka tıkla. Kaldırmak için tekrar tıkla."
+        }
         _ => return None,
     })
 }

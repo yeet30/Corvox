@@ -78,17 +78,17 @@ impl Icon {
 /// Frameless icon button tinted with the current text color (brighter on hover).
 pub fn button(ui: &mut Ui, icon: Icon, tip: &str) -> Response {
     let col = ui.visuals().widgets.inactive.fg_stroke.color;
-    ui.add(egui::Button::image(icon.image(16.0, col)).frame(false)).on_hover_text(tip)
+    ui.add(egui::Button::image(icon.image(16.0, col)).frame(false)).on_hover_text(tip).on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
 pub fn button_tinted(ui: &mut Ui, icon: Icon, tint: Color32, tip: &str) -> Response {
-    ui.add(egui::Button::image(icon.image(16.0, tint)).frame(false)).on_hover_text(tip)
+    ui.add(egui::Button::image(icon.image(16.0, tint)).frame(false)).on_hover_text(tip).on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
 /// Normal button with an icon on the left.
 pub fn labeled(ui: &mut Ui, icon: Icon, text: &str) -> Response {
     let col = ui.visuals().widgets.inactive.fg_stroke.color;
-    ui.add(egui::Button::image_and_text(icon.image(14.0, col), text))
+    ui.add(egui::Button::image_and_text(icon.image(14.0, col), text)).on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
 pub fn small(ui: &mut Ui, icon: Icon, tint: Color32) {

@@ -7,10 +7,12 @@ Type a line, hear it in **your own voice** in Discord (or any app with a mic set
 
 Corvox copies your voice from a short clip (10–20 seconds, any audio file) and speaks whatever you type into a virtual microphone. Discord just sees a mic. No bot, no Discord tokens, and your text and voice never leave your PC (only the models are downloaded).
 
-- Small native window (Rust + egui), collapses into a one-line bar (drag it from anywhere)
+- Small native window (Rust + egui), collapses into a one-line bar (drag it from anywhere). The bar's four-arrow button sticks it to a screen corner: click the arrow toward a corner, click it again to unstick
 - A global shortcut brings Corvox up; press it again to go back to the window you were in
 - Recent and pinned phrases: click one, or use ↑/↓, to say it again. Their audio is saved, so they replay instantly without the engine (can be turned off, and you choose how many to keep)
 - Engines install and download in the background with Pause/Resume, while the current one keeps working; a chime plays when one is ready
+- Switching engines: the one you left stays loaded for 3 minutes, so switching back is instant (its process quits after 10 minutes)
+- Updates itself from GitHub Releases: Settings shows when a new version is out, and **Update and restart** installs it
 - Delete an engine's packages and model (including half-finished downloads) from its card; clear uv's download cache in Settings
 - English or Turkish interface
 - Pick a language, then any engine that speaks it. CPU engines work on any PC; GPU engines are optional
@@ -47,10 +49,17 @@ Engines are installed from inside the app, with a progress bar for each step: Py
 
 ## Setup
 
-### 1. Install uv
+### 1. Get Corvox
 
-- Windows: `winget install astral-sh.uv`
-- macOS / Linux: `curl -LsSf https://astral.sh/uv/install.sh | sh`
+Download the zip for your system from [Releases](../../releases/latest) and unzip it anywhere you like. It has everything: the app, the engine code and [uv](https://docs.astral.sh/uv/) (by Astral, MIT/Apache-2.0), which sets up the engines' Python for you.
+
+- Windows: run `corvox.exe`. SmartScreen may warn about an unknown app (it isn't code-signed): **More info → Run anyway**.
+- macOS (Apple Silicon): the app isn't signed either. Run `xattr -dr com.apple.quarantine Corvox` once on the unzipped folder, then start `Corvox/corvox`.
+- Linux: run `./corvox`.
+
+Corvox checks for a newer release when it starts (Settings → Updates; can be turned off). **Update and restart** downloads it, swaps it in place and reopens. Your settings, voices and engines are kept, and engines whose packages changed are brought up to date on the next start.
+
+Or build it yourself, see [Building](#building).
 
 ### 2. Virtual microphone
 
@@ -71,18 +80,7 @@ pactl load-module module-remap-source master=corvox.monitor source_name=corvox_m
 
 Corvox picks the cable automatically. You can change it in Settings.
 
-### 3. Get Corvox
-
-Download a release, or build it:
-
-```bash
-git clone <this repo> && cd <repo>/app
-cargo build --release
-```
-
-Keep the `engines/` folder next to the app (or set `CORVOX_ENGINES` to its path). On Windows, build from PowerShell or cmd (Git Bash's `link` command shadows the MSVC linker).
-
-### 4. First run
+### 3. First run
 
 1. **Voice** button: pick an MP3/WAV/M4A of you talking for 10–20 s, no music or noise.
 2. **Engine** button: pick your language, install an engine, select it.
@@ -99,12 +97,34 @@ Cloning models also continue from the end of the clip, so Corvox feeds them the 
 - **Voice activity**: works too, set the sensitivity so silence doesn't trigger it.
 - Want to talk *and* type? Use VoiceMeeter (Windows) or a PipeWire loopback to mix your real mic with the cable.
 
+## Building
+
+Needs [Rust](https://rustup.rs) and uv (`winget install astral-sh.uv`, or `curl -LsSf https://astral.sh/uv/install.sh | sh` on macOS/Linux).
+
+```bash
+git clone <this repo> && cd <repo>/app
+cargo build --release
+```
+
+Keep the `engines/` folder next to the app or above it (or set `CORVOX_ENGINES` to its path). On Windows, build from PowerShell or cmd (Git Bash's `link` command shadows the MSVC linker). On Linux you need the ALSA, GTK 3, xdo and xkbcommon development packages (see `.github/workflows/ci.yml`).
+
+A build run from a source checkout tells you about new releases but doesn't replace itself.
+
+## Releasing
+
+`.github/workflows/release.yml` builds Windows, macOS and Linux zips and publishes a GitHub Release when a version tag is pushed:
+
+1. Bump `version` in `app/Cargo.toml` (the tag must match it).
+2. Commit and push, then `git tag v0.2.0 && git push origin v0.2.0`.
+
+Running the workflow by hand from the Actions tab only builds the zips. Release builds look for updates in the repository they were built from, so a fork updates from its own releases. `ci.yml` builds and tests on all three systems on every push.
+
 ## Development
 
 ```bash
 cd app
 cargo run                      # debug build
-cargo test                     # audio import tests
+cargo test                     # audio import and updater tests
 ```
 
 Debug switches (environment variables):
@@ -117,6 +137,7 @@ Debug switches (environment variables):
 - `CORVOX_INSTALL=<env>`: start installing an engine environment on launch
 - `CORVOX_OFFSCREEN=1`: open off-screen without taking focus (for screenshots)
 - `CORVOX_THREADS=n`: CPU threads for Pocket engines (default 4)
+- `CORVOX_UPDATE_URL=<url>`: where to look for the latest release instead of the GitHub API (testing the updater)
 
 Run the helper by hand: `cd engines/pocket && uv run python -m corvox_engine --bench --model pocket-tr --language tr --voice my.wav`
 

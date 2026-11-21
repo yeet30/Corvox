@@ -131,6 +131,9 @@ class Server:
 
     def run(self) -> None:
         threading.Thread(target=self._reader, daemon=True).start()
+        # Importing PyTorch takes ~5 s on Windows; start now so it overlaps with the app
+        # sending its first request (a later import just waits for this one to finish).
+        threading.Thread(target=lambda: __import__("torch"), daemon=True).start()
         send({"event": "ready"})
         while True:
             self.handle(self.requests.get())

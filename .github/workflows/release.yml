@@ -1,0 +1,134 @@
+# Builds Corvox for Windows, macOS and Linux and publishes a GitHub Release.
+#
+# To release: bump `version` in app/Cargo.toml, commit, then push a matching tag:
+#   git tag v0.2.0 && git push origin v0.2.0
+# Running it by hand (Actions tab > Release > Run workflow) only builds the zips; download
+# them from the run's page.
+#
+# Each zip holds the app, engines/, uv (so engines install with nothing else on the PC),
+# README and LICENSE. The app's updater looks for `corvox-<version>-<os>.zip` in the latest
+# release of the repo it was built from.
+
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: never
+  UV_VERSION: "0.12.22"
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            suffix: windows-x64
+            exe: .exe
+            uv: uv-x86_64-pc-windows-msvc.zip
+          - os: macos-latest
+            suffix: macos-arm64
+            exe: ""
+            uv: uv-aarch64-apple-darwin.tar.gz
+          - os: ubuntu-22.04
+            suffix: linux-x64
+            exe: ""
+            uv: uv-x86_64-unknown-linux-gnu.tar.gz
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: app
+
+      - name: Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libasound2-dev libgtk-3-dev libxdo-dev libxkbcommon-dev \
+            libxkbcommon-x11-dev libwayland-dev libx11-dev libxi-dev libxtst-dev libssl-dev
+
+      - name: Read version
+        id: v
+        run: |
+          version=$(grep -m1 '^version' app/Cargo.toml | cut -d'"' -f2)
+          if [[ "$GITHUB_REF_TYPE" == "tag" && "$GITHUB_REF_NAME" != "v$version" ]]; then
+            echo "::error::Tag $GITHUB_REF_NAME doesn't match app/Cargo.toml version $version"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Test
+        working-directory: app
+        run: cargo test --release --locked
+
+      - name: Build
+        working-directory: app
+        env:
+          CORVOX_REPO: ${{ github.repository }}
+        run: cargo build --release --locked
+
+      - name: Package
+        run: |
+          name="corvox-${{ steps.v.outputs.version }}-${{ matrix.suffix }}"
+          out="dist/Corvox"
+          mkdir -p "$out"
+          cp "app/target/release/corvox${{ matrix.exe }}" "$out/"
+          cp README.md LICENSE "$out/"
+          cp -r engines "$out/"
+          find "$out/engines" -name __pycache__ -type d -prune -exec rm -rf {} +
+
+          curl -fsSL --retry 3 -o uv-archive "https://github.com/astral-sh/uv/releases/download/${UV_VERSION}/${{ matrix.uv }}"
+          mkdir uv-x
+          if [[ "$RUNNER_OS" == "Windows" ]]; then
+            7z x -y -ouv-x uv-archive > /dev/null
+          else
+            tar -xzf uv-archive -C uv-x --strip-components=1
+          fi
+          cp "uv-x/uv${{ matrix.exe }}" "$out/"
+
+          cd dist
+          if [[ "$RUNNER_OS" == "Windows" ]]; then
+            7z a -tzip "$name.zip" Corvox > /dev/null
+          else
+            zip -qry "$name.zip" Corvox
+          fi
+          echo "ZIP=dist/$name.zip" >> "$GITHUB_ENV"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.suffix }}
+          path: ${{ env.ZIP }}
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/*.zip \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "Corvox ${GITHUB_REF_NAME#v}" \
+            --generate-notes

@@ -3,6 +3,25 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+/// A screen corner the window sticks to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Corner {
+    TopLeft,
+    TopRight,
+    BottomLeft,
+    BottomRight,
+}
+
+impl Corner {
+    pub const ALL: [Corner; 4] = [Corner::TopLeft, Corner::TopRight, Corner::BottomLeft, Corner::BottomRight];
+    pub fn left(self) -> bool {
+        matches!(self, Corner::TopLeft | Corner::BottomLeft)
+    }
+    pub fn top(self) -> bool {
+        matches!(self, Corner::TopLeft | Corner::TopRight)
+    }
+}
+
 /// Numbers from "Test on my PC", stored per engine.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct BenchResult {
@@ -51,6 +70,10 @@ pub struct Config {
     pub phrase_limit: usize,
     /// Models already downloaded, as model keys ("xtts", "pocket-tr", "pocket:fr", ...).
     pub downloaded: Vec<String>,
+    /// Screen corner the window sticks to, if any.
+    pub snap: Option<Corner>,
+    /// Look for a new release on GitHub when Corvox starts.
+    pub check_updates: bool,
 }
 
 impl Default for Config {
@@ -76,6 +99,8 @@ impl Default for Config {
             keep_phrases: true,
             phrase_limit: 8,
             downloaded: vec![],
+            snap: None,
+            check_updates: true,
         }
     }
 }

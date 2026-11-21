@@ -38,11 +38,15 @@ pub enum Event {
     VmicDone { code: i32 },
     DeleteDone { engine: String, freed_mb: f32, error: Option<String> },
     CacheCleaned { result: Result<String, String> },
+    /// `Some` when a newer release exists. `manual`: the user pressed "Check now".
+    UpdateChecked { result: Result<Option<crate::update::Release>, String>, manual: bool },
+    UpdateProgress { done: u64, total: u64 },
+    UpdateDone { result: Result<(), String> },
 }
 
 pub type Tx = (Sender<Event>, eframe::egui::Context);
 
-fn send(tx: &Tx, e: Event) {
+pub(crate) fn send(tx: &Tx, e: Event) {
     let _ = tx.0.send(e);
     tx.1.request_repaint();
 }
@@ -55,6 +59,27 @@ const MARKER: &str = ".corvox-installed";
 
 pub fn is_installed(env: &str) -> bool {
     env_dir(env).join(MARKER).is_file()
+}
+
+/// Fingerprint of an environment's package list (pyproject.toml + uv.lock). Stored in the
+/// install marker, so an app update that changes an engine's packages is noticed.
+fn deps_stamp(engines: &Path, env: &str) -> String {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for f in ["pyproject.toml", "uv.lock"] {
+        for b in std::fs::read(engines.join(env).join(f)).unwrap_or_default() {
+            h ^= b as u64;
+            h = h.wrapping_mul(0x100_0000_01b3);
+        }
+    }
+    format!("{h:016x}")
+}
+
+/// Installed, but with an older package list than this version of Corvox ships.
+pub fn is_outdated(engines: &Path, env: &str) -> bool {
+    match std::fs::read_to_string(env_dir(env).join(MARKER)) {
+        Ok(s) => s.trim() != deps_stamp(engines, env),
+        Err(_) => false,
+    }
 }
 
 fn base_command(uv: &Path, engines: &Path, env: &str) -> Command {
@@ -102,6 +127,9 @@ fn python_command(uv: &Path, engines: &Path, env: &str, agreed: bool, int8: bool
         c
     };
     c.args(["-m", "corvox_engine"]);
+    // Run this app folder's engine code even if the environment was set up from another
+    // folder (Corvox moved or updated): PYTHONPATH comes before the editable install.
+    c.env("PYTHONPATH", engines.join("core"));
     c.env("CORVOX_QUANTIZE", if int8 { "1" } else { "0" }).env("HF_HUB_DISABLE_SYMLINKS_WARNING", "1");
     if agreed {
         c.env("COQUI_TOS_AGREED", "1");
@@ -241,7 +269,7 @@ pub fn install(uv: PathBuf, engines: PathBuf, env: String, tx: Tx) -> CancelHand
         let cancelled = status.is_none();
         let ok = matches!(status, Some(Ok(s)) if s.success());
         if ok {
-            let _ = std::fs::write(env_dir(&env).join(MARKER), "ok");
+            let _ = std::fs::write(env_dir(&env).join(MARKER), deps_stamp(&engines, &env));
         }
         send(&tx, Event::InstallDone { env, ok, cancelled });
     });

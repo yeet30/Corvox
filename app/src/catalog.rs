@@ -139,6 +139,13 @@ pub fn find_engines_dir() -> Option<PathBuf> {
 /// Finds the `uv` executable: on PATH, or in the usual install locations.
 pub fn find_uv() -> Option<PathBuf> {
     let exe = if cfg!(windows) { "uv.exe" } else { "uv" };
+    // Release zips ship uv next to the app.
+    if let Some(dir) = std::env::current_exe().ok().and_then(|p| p.parent().map(Path::to_path_buf)) {
+        let p = dir.join(exe);
+        if p.is_file() {
+            return Some(p);
+        }
+    }
     if let Some(paths) = std::env::var_os("PATH") {
         for dir in std::env::split_paths(&paths) {
             let p = dir.join(exe);
