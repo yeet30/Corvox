@@ -6,6 +6,11 @@ pub const KEYS: [&str; 15] = [
     "F13", "F14", "F15", "F16", "F17", "F18", "F19", "F20", "F21", "F22", "F23", "F24", "ScrollLock", "Pause", "CapsLock",
 ];
 
+/// Whether this system can press `name` (one of [`KEYS`]).
+pub fn supported(name: &str) -> bool {
+    parse(name).is_some()
+}
+
 fn parse(name: &str) -> Option<Key> {
     Some(match name {
         "F13" => Key::F13,
@@ -16,9 +21,14 @@ fn parse(name: &str) -> Option<Key> {
         "F18" => Key::F18,
         "F19" => Key::F19,
         "F20" => Key::F20,
+        // macOS stops at F20.
+        #[cfg(not(target_os = "macos"))]
         "F21" => Key::F21,
+        #[cfg(not(target_os = "macos"))]
         "F22" => Key::F22,
+        #[cfg(not(target_os = "macos"))]
         "F23" => Key::F23,
+        #[cfg(not(target_os = "macos"))]
         "F24" => Key::F24,
         #[cfg(target_os = "windows")]
         "ScrollLock" => Key::Scroll,

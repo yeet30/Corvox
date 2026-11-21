@@ -2252,7 +2252,7 @@ impl App {
             let mut ptt_changed = false;
             egui::ComboBox::from_id_salt("ptt").selected_text(self.cfg.ptt_key.clone().unwrap_or_else(|| t("Off").into())).show_ui(ui, |ui| {
                 ptt_changed |= ui.selectable_value(&mut self.cfg.ptt_key, None, t("Off")).changed();
-                for k in ptt::KEYS {
+                for k in ptt::KEYS.into_iter().filter(|k| ptt::supported(k)) {
                     ptt_changed |= ui.selectable_value(&mut self.cfg.ptt_key, Some(k.to_string()), k).changed();
                 }
             });

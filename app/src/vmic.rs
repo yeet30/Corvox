@@ -8,8 +8,12 @@
 //! - Linux: creates a PipeWire/PulseAudio null sink plus a mic that listens to it (no install).
 //! - macOS: there's no unattended option for BlackHole, so the UI opens its download page.
 
+#[cfg(windows)]
 use std::io::{BufRead, BufReader};
-use std::process::{Command, Stdio};
+#[cfg(not(target_os = "macos"))]
+use std::process::Command;
+#[cfg(windows)]
+use std::process::Stdio;
 
 use crate::engine::{Event, Tx};
 
