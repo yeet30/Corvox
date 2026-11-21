@@ -1239,6 +1239,9 @@ impl App {
                     if matches!(self.upd, Upd::Downloading { .. } | Upd::Restarting) {
                         continue;
                     }
+                    if !manual && self.upd != Upd::Idle {
+                        continue; // the startup check answered late; "Check now" has the say
+                    }
                     self.upd = match result {
                         Ok(Some(r)) => Upd::Available(r),
                         Ok(None) if manual => Upd::UpToDate,
