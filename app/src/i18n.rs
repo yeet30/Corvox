@@ -337,6 +337,48 @@ fn tr(en: &str) -> Option<&'static str> {
         "Update failed: {}" => "Güncelleme başarısız: {}",
         "Updating {} packages…" => "{} paketleri güncelleniyor…",
         "Couldn't update the engine's packages: {}" => "Motorun paketleri güncellenemedi: {}",
+        "Record your voice" => "Sesini kaydet",
+        "Microphone" => "Mikrofon",
+        "none found" => "bulunamadı",
+        "Default ({})" => "Varsayılan ({})",
+        "Read this out loud at your normal pace (or say anything), then pause for a second before stopping:" => {
+            "Bunu normal hızında sesli oku (ya da istediğini söyle), durdurmadan önce bir saniye sus:"
+        }
+        "Record" => "Kayda başla",
+        "Your recording stays on this PC." => "Kaydın bu bilgisayarda kalır.",
+        "Aim for 10–20 seconds." => "10–20 saniye hedefle.",
+        "Good length. Stop whenever you're done." => "Uzunluk iyi. Bitince durdur.",
+        "That's plenty. Stops by itself at {} seconds." => "Bu kadarı yeter. {} saniyede kendiliğinden durur.",
+        "No sound is coming in. Check that the microphone isn't muted and that apps may use it (Windows: Settings > Privacy > Microphone)." => {
+            "Ses gelmiyor. Mikrofonun kapalı olmadığını ve uygulamaların kullanabildiğini denetle (Windows: Ayarlar > Gizlilik > Mikrofon)."
+        }
+        "{} s recorded" => "{} sn kaydedildi",
+        "Listen" => "Dinle",
+        "Record again" => "Yeniden kaydet",
+        "The recording is silent. Check the microphone and try again." => "Kayıt sessiz. Mikrofonu denetleyip tekrar dene.",
+        "Less than 3 seconds of speech. Record a bit more." => "3 saniyeden az konuşma var. Biraz daha kaydet.",
+        "Very quiet. Move closer to the microphone or turn it up." => "Çok sessiz. Mikrofona yaklaş ya da sesini aç.",
+        "It's distorting (too loud). Move back a little or turn the microphone down." => "Ses bozuluyor (çok yüksek). Biraz uzaklaş ya da mikrofonun sesini kıs.",
+        "Name" => "Ad",
+        "Save and use" => "Kaydet ve kullan",
+        "Discard" => "Sil",
+        "My voice" => "Sesim",
+        "Couldn't open the microphone: {}" => "Mikrofon açılamadı: {}",
+        "Delete the voice \"{}\"? Its audio file is removed for good." => "\"{}\" sesi silinsin mi? Ses dosyası kalıcı olarak silinir.",
+        "Delete the voice \"{}\"? Its audio file is removed for good. It's the voice in use, so Corvox switches to another one." => {
+            "\"{}\" sesi silinsin mi? Ses dosyası kalıcı olarak silinir. Kullanılan ses bu, Corvox başka birine geçer."
+        }
+        "Throw this recording away?" => "Bu kayıt atılsın mı?",
+        "Minimize" => "Simge durumuna küçült",
+        "Minimize to the tray" => "Sistem tepsisine küçült",
+        "Minimize to" => "Küçültünce",
+        "Taskbar" => "Görev çubuğu",
+        "System tray (next to the clock)" => "Sistem tepsisi (saatin yanı)",
+        "To bring it back, click the Corvox icon next to the clock (Windows may tuck it under ^) or press the shortcut." => {
+            "Geri getirmek için saatin yanındaki Corvox simgesine tıkla (Windows onu ^ altına saklayabilir) ya da kısayola bas."
+        }
+        "Show Corvox" => "Corvox'u göster",
+        "Quit" => "Çık",
         "Stick to a corner: click the arrow toward it. Click it again to unstick." => {
             "Bir köşeye sabitle: o köşeyi gösteren oka tıkla. Kaldırmak için tekrar tıkla."
         }

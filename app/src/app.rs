@@ -13,6 +13,7 @@ use crate::i18n::{self, t, tf};
 use crate::icons::{self, Icon};
 use crate::platform;
 use crate::ptt::{self, Ptt};
+use crate::tray;
 use crate::update;
 use crate::vmic;
 
@@ -65,6 +66,28 @@ impl Msg {
         tf(self.key, &args)
     }
 }
+
+/// Recording a voice on the Voices page.
+#[derive(Default)]
+struct Rec {
+    /// Running while recording.
+    recorder: Option<audio::Recorder>,
+    /// Shown level, decaying smoothly.
+    level: f32,
+    /// Loudest sample of the whole recording so far (all zeros: the mic is blocked or muted).
+    loudest: f32,
+    /// A finished recording waiting to be saved or thrown away.
+    take: Option<(Vec<f32>, u32)>,
+    /// "Throw away this recording?" is showing.
+    confirm_discard: bool,
+    issue: Option<audio::TakeIssue>,
+    name: String,
+    error: Option<Msg>,
+    mics: Vec<String>,
+}
+
+/// Recording stops by itself here.
+const REC_MAX_SECS: f32 = 30.0;
 
 /// Where the update check / install stands.
 #[derive(Clone, PartialEq)]
@@ -193,11 +216,14 @@ pub struct App {
     benching: HashMap<String, String>,
     agree_prompt: Option<String>,
     delete_prompt: Option<String>,
+    /// Voice clip waiting for "are you sure?" before it's deleted.
+    voice_delete_prompt: Option<String>,
     deleting: HashSet<String>,
     cache_msg: Option<Msg>,
     cleaning_cache: bool,
     voices: Vec<String>,
     importing: bool,
+    rec: Rec,
     hotkey_text: String,
     hf_input: String,
     hf_msg: Option<Msg>,
@@ -207,9 +233,13 @@ pub struct App {
     win: Option<platform::Window>,
     prev_window: Option<std::sync::Arc<std::sync::atomic::AtomicIsize>>,
     scroll_to: Option<String>,
+    /// Scroll the engine list to the engine in use (just opened the page).
+    show_current_engine: bool,
     /// Re-apply the corner snap once the first frame knows the screen scale.
     snap_pending: bool,
     upd: Upd,
+    /// The tray icon while Corvox is minimized to the tray.
+    tray: Option<tray::Tray>,
     /// Running from a release folder we can write to, so updates can install themselves.
     self_update_ok: bool,
     /// Installed engine environments whose packages are being brought up to date after an
@@ -233,12 +263,18 @@ impl App {
         let player = Player::new(mic.as_deref(), cfg.monitor, cfg.monitor_volume);
 
         // Global hotkey events arrive on their own channel; forward them so the UI wakes up.
+        // While Corvox sits in the tray nothing is drawn, so the shortcut shows it right here.
         let htx = tx.clone();
+        let hwnd = platform::Window::from(cc).map(|w| w.raw()).unwrap_or(0);
         std::thread::spawn(move || {
             while let Ok(e) = global_hotkey::GlobalHotKeyEvent::receiver().recv() {
                 if e.state == global_hotkey::HotKeyState::Pressed {
-                    let _ = htx.0.send(Event::Hotkey);
-                    htx.1.request_repaint();
+                    if platform::is_hidden_raw(hwnd) {
+                        tray::restore(hwnd, &htx);
+                    } else {
+                        let _ = htx.0.send(Event::Hotkey);
+                        htx.1.request_repaint();
+                    }
                 }
             }
         });
@@ -281,11 +317,13 @@ impl App {
             benching: HashMap::new(),
             agree_prompt: None,
             delete_prompt: None,
+            voice_delete_prompt: None,
             deleting: HashSet::new(),
             cache_msg: None,
             cleaning_cache: false,
             voices: config::list_voices(),
             importing: false,
+            rec: Rec::default(),
             hf_input: String::new(),
             hf_msg: None,
             hotkey_mgr: global_hotkey::GlobalHotKeyManager::new().ok(),
@@ -294,8 +332,10 @@ impl App {
             win: platform::Window::from(cc),
             prev_window: None,
             scroll_to: None,
+            show_current_engine: false,
             snap_pending: true,
             upd: Upd::Idle,
+            tray: None,
             self_update_ok: update::can_self_update(),
             resyncing: HashSet::new(),
         };
@@ -304,6 +344,8 @@ impl App {
         }
         if let Some(w) = app.win {
             w.round_corners();
+            let (rgba, size) = icons::app_icon_rgba(64);
+            w.set_big_icon(&rgba, size);
             app.prev_window = Some(w.track_previous());
         }
         if app.cfg.vmic_setup {
@@ -326,7 +368,10 @@ impl App {
             app.show_all_engines = true;
         }
         match std::env::var("CORVOX_SHOT_PAGE").as_deref() {
-            Ok("engines") => app.page = Page::Engines,
+            Ok("engines") => {
+                app.page = Page::Engines;
+                app.show_current_engine = true;
+            }
             Ok("voices") => app.page = Page::Voices,
             Ok("settings") => app.page = Page::Settings,
             _ => {}
@@ -856,6 +901,30 @@ impl App {
         self.focus_text = true;
     }
 
+    fn minimize_tip(&self) -> &'static str {
+        if self.cfg.minimize_to_tray && tray::supported() {
+            t("Minimize to the tray")
+        } else {
+            t("Minimize")
+        }
+    }
+
+    /// Minimizes to the taskbar, or hides to the tray if that's chosen in Settings.
+    fn minimize(&mut self) {
+        if self.cfg.minimize_to_tray && tray::supported() {
+            if let Some(w) = self.win {
+                if self.tray.is_none() {
+                    self.tray = tray::Tray::show(w.raw(), self.tx.clone());
+                }
+                if self.tray.is_some() {
+                    w.hide();
+                    return;
+                }
+            }
+        }
+        self.tx.1.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+    }
+
     /// Moves the window into a corner of its screen's usable area (taskbar excluded).
     fn snap_to(&mut self, corner: Corner, size: Vec2) {
         let ctx = self.tx.1.clone();
@@ -1249,6 +1318,11 @@ impl App {
                         _ => Upd::Idle, // the quiet check at startup only speaks up when there's news
                     };
                 }
+                Event::Restored => {
+                    self.tray = None; // removes the tray icon
+                    self.focus_text = true;
+                    self.tx.1.request_repaint();
+                }
                 Event::UpdateProgress { done: d, total: tot } => {
                     if let Upd::Downloading { done, total, .. } = &mut self.upd {
                         *done = d;
@@ -1316,6 +1390,9 @@ impl App {
                 // Same spot as the bar's expand button, so switching back and forth needs no mouse move.
                 if icons::button(ui, Icon::ChevronDown, t("Collapse to a bar")).clicked() {
                     self.expand(false);
+                }
+                if icons::button(ui, Icon::Minimize, self.minimize_tip()).clicked() {
+                    self.minimize();
                 }
                 let on_top = self.cfg.always_on_top;
                 let (icon, tip) = if on_top {
@@ -1392,7 +1469,7 @@ impl App {
             if self.busy() {
                 self.stop();
             } else {
-                ui.ctx().send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+                self.minimize();
             }
         }
     }
@@ -1588,6 +1665,7 @@ impl App {
             let ename = self.engine().map(|e| short_name(&e.name)).unwrap_or_else(|| t("Engine").into());
             if icons::labeled(ui, Icon::Cpu, &ename).on_hover_text(t("Engines and their stats")).clicked() {
                 self.page = Page::Engines;
+                self.show_current_engine = true;
             }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| self.status_chip(ui));
         });
@@ -1716,6 +1794,7 @@ impl App {
                 self.engine_card(ui, &cat, e);
                 ui.add_space(4.0);
             }
+            self.show_current_engine = false;
             ui.label(
                 RichText::new(t("Voice match compares the output to your clip. Clarity is how well Whisper understands it. Speed is seconds of speech per second of work."))
                     .small()
@@ -1819,6 +1898,10 @@ impl App {
 
             self.engine_actions(ui, cat, e, installed, downloaded, speaks_lang, &mkey, waiting);
         });
+        // Opening the page shows the engine in use.
+        if self.show_current_engine && e.id == self.cfg.engine {
+            card.response.scroll_to_me(Some(Align::Min));
+        }
         // Bring an engine into view when its install starts.
         if self.installs.contains_key(&e.env) && self.scroll_to.as_deref() == Some(e.env.as_str()) {
             card.response.scroll_to_me(Some(Align::Center));
@@ -2102,6 +2185,10 @@ impl App {
 
     fn voices_page(&mut self, ui: &mut egui::Ui) {
         self.back_header(ui, t("Voices"));
+        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| self.voices_list(ui));
+    }
+
+    fn voices_list(&mut self, ui: &mut egui::Ui) {
         ui.label(
             RichText::new(t("Use 10–20 seconds of you talking normally: no music, no background noise. Corvox uses the part that ends at a natural pause."))
                 .small()
@@ -2113,6 +2200,7 @@ impl App {
         let mut select = None;
         let mut play = None;
         for v in self.voices.clone() {
+            let asking = self.voice_delete_prompt.as_deref() == Some(v.as_str());
             ui.horizontal(|ui| {
                 let sel = self.cfg.voice.as_deref() == Some(v.as_str());
                 if ui.radio(sel, &v).clicked() && !sel {
@@ -2121,14 +2209,33 @@ impl App {
                 let secs = audio::wav_seconds(&config::voices_dir().join(format!("{v}.wav"))).unwrap_or(0.0);
                 ui.label(RichText::new(tf("{} s clip", &[&format!("{secs:.0}")])).small().weak());
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    if icons::button(ui, Icon::Trash, t("Delete")).clicked() {
-                        delete = Some(v.clone());
+                    let tint = if asking { GOLD } else { ui.visuals().widgets.inactive.fg_stroke.color };
+                    if icons::button_tinted(ui, Icon::Trash, tint, t("Delete")).clicked() {
+                        self.voice_delete_prompt = if asking { None } else { Some(v.clone()) };
                     }
                     if icons::button(ui, Icon::Play, t("Play the clip")).clicked() {
                         play = Some(v.clone());
                     }
                 });
             });
+            if asking {
+                let msg = if self.cfg.voice.as_deref() == Some(v.as_str()) {
+                    tf("Delete the voice \"{}\"? Its audio file is removed for good. It's the voice in use, so Corvox switches to another one.", &[&v])
+                } else {
+                    tf("Delete the voice \"{}\"? Its audio file is removed for good.", &[&v])
+                };
+                ui.label(RichText::new(msg).small().color(GOLD));
+                ui.horizontal(|ui| {
+                    if icons::labeled(ui, Icon::Trash, t("Delete")).clicked() {
+                        delete = Some(v.clone());
+                        self.voice_delete_prompt = None;
+                    }
+                    if ui.button(t("Cancel")).clicked() {
+                        self.voice_delete_prompt = None;
+                    }
+                });
+                ui.add_space(4.0);
+            }
         }
         if let Some(v) = select {
             self.cfg.voice = Some(v);
@@ -2150,6 +2257,8 @@ impl App {
             if self.cfg.voice.as_deref() == Some(v.as_str()) {
                 self.cfg.voice = self.voices.first().cloned();
                 self.cfg.save();
+                self.tidy_phrase_cache();
+                self.preload(true);
             }
         }
         ui.add_space(6.0);
@@ -2159,6 +2268,227 @@ impl App {
                 ui.label(t("Preparing the clip…"));
             } else if icons::labeled(ui, Icon::Plus, t("Add voice from a file…")).clicked() {
                 self.import_voice();
+            }
+        });
+        ui.add_space(10.0);
+        self.recorder_box(ui);
+    }
+
+    /// A unique voice name starting with `base`: "base", "base 2", ...
+    fn free_voice_name(base: &str) -> String {
+        let base: String = base.chars().map(|c| if c.is_alphanumeric() || c == '-' || c == ' ' { c } else { '_' }).collect();
+        let base = if base.trim().is_empty() { "voice".to_string() } else { base.trim().to_string() };
+        let mut name = base.clone();
+        let mut n = 2;
+        while config::voices_dir().join(format!("{name}.wav")).exists() {
+            name = format!("{base} {n}");
+            n += 1;
+        }
+        name
+    }
+
+    fn start_recording(&mut self) {
+        self.player.stop_local();
+        self.rec.confirm_discard = false;
+        self.rec.take = None;
+        self.rec.issue = None;
+        self.rec.error = None;
+        self.rec.loudest = 0.0;
+        match audio::Recorder::start(self.cfg.input_device.as_deref()) {
+            Ok(r) => self.rec.recorder = Some(r),
+            Err(e) => self.rec.error = Some(Msg::new("Couldn't open the microphone: {}", &[&e.to_string()])),
+        }
+    }
+
+    fn stop_recording(&mut self) {
+        let Some(r) = self.rec.recorder.take() else { return };
+        let (samples, sr) = r.finish();
+        self.rec.level = 0.0;
+        self.rec.issue = audio::check_take(&samples, sr);
+        if self.rec.name.trim().is_empty() || config::voices_dir().join(format!("{}.wav", self.rec.name.trim())).exists() {
+            self.rec.name = Self::free_voice_name(t("My voice"));
+        }
+        self.rec.take = Some((samples, sr));
+    }
+
+    fn save_recording(&mut self) {
+        let Some((samples, sr)) = self.rec.take.take() else { return };
+        self.rec.confirm_discard = false;
+        self.player.stop_local();
+        let name = Self::free_voice_name(&self.rec.name);
+        self.rec.issue = None;
+        self.importing = true;
+        let tx = self.tx.clone();
+        std::thread::spawn(move || {
+            let dest = config::voices_dir().join(format!("{name}.wav"));
+            let r = audio::save_take(&samples, sr, &dest).map_err(|e| e.to_string());
+            let _ = tx.0.send(Event::Status(match &r {
+                Ok(secs) => format!("voice-ok:{name}:{secs:.1}"),
+                Err(e) => format!("voice-err:{e}"),
+            }));
+            tx.1.request_repaint();
+        });
+    }
+
+    /// "Record your voice": pick a mic, read the text out loud, listen back, save.
+    fn recorder_box(&mut self, ui: &mut egui::Ui) {
+        egui::Frame::group(ui.style()).corner_radius(CornerRadius::same(8)).show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.label(RichText::new(t("Record your voice")).strong());
+
+            // Microphone
+            if self.rec.mics.is_empty() {
+                self.rec.mics = audio::input_device_names();
+            }
+            let recording = self.rec.recorder.is_some();
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(t("Microphone")).small().weak());
+                let auto = audio::default_input_name().unwrap_or_else(|| t("none found").into());
+                let shown = self.cfg.input_device.clone().unwrap_or_else(|| tf("Default ({})", &[&auto]));
+                let mut changed = false;
+                ui.add_enabled_ui(!recording, |ui| {
+                    egui::ComboBox::from_id_salt("mic").selected_text(truncate(&shown, 34)).width(250.0).show_ui(ui, |ui| {
+                        if ui.selectable_label(self.cfg.input_device.is_none(), tf("Default ({})", &[&auto])).clicked() {
+                            self.cfg.input_device = None;
+                            changed = true;
+                        }
+                        for m in self.rec.mics.clone() {
+                            if ui.selectable_label(self.cfg.input_device.as_deref() == Some(m.as_str()), &m).clicked() {
+                                self.cfg.input_device = Some(m);
+                                changed = true;
+                            }
+                        }
+                    });
+                    if icons::button(ui, Icon::Refresh, t("Refresh devices")).clicked() {
+                        self.rec.mics = audio::input_device_names();
+                    }
+                });
+                if changed {
+                    self.cfg.save();
+                }
+            });
+
+            // Something to read
+            let script = if self.cfg.language == "tr" {
+                "Merhaba, bu Corvox için kaydettiğim sesim. Birkaç cümleyi normal hızımda, arkadaşlarımla konuşur gibi okuyorum. Bugün hava güzel, belki akşam birkaç el oynarız. Tamam, şimdilik bu kadar."
+            } else {
+                "Hi, this is my voice for Corvox. I'm reading a few sentences at my normal pace, the way I'd talk to my friends. The weather is nice today, so maybe we'll play a few rounds tonight. Okay, that's enough for now."
+            };
+            ui.label(RichText::new(t("Read this out loud at your normal pace (or say anything), then pause for a second before stopping:")).small().weak());
+            egui::Frame::new().fill(ui.visuals().extreme_bg_color).corner_radius(CornerRadius::same(6)).inner_margin(8.0).show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.label(RichText::new(script).italics());
+            });
+            ui.add_space(4.0);
+
+            if let Some(r) = &self.rec.recorder {
+                // Recording: Stop, time, level
+                let secs = r.seconds();
+                let peak = r.take_peak();
+                self.rec.loudest = self.rec.loudest.max(peak);
+                self.rec.level = peak.max(self.rec.level * 0.85);
+                let mut stop = secs >= REC_MAX_SECS;
+                ui.horizontal(|ui| {
+                    if icons::labeled(ui, Icon::Stop, t("Stop")).clicked() {
+                        stop = true;
+                    }
+                    let (dot, _) = ui.allocate_exact_size(Vec2::splat(10.0), Sense::hover());
+                    let blink = (ui.input(|i| i.time) * 2.0) as i64 % 2 == 0;
+                    ui.painter().circle_filled(dot.center(), 4.5, if blink { RED } else { RED.gamma_multiply(0.4) });
+                    let time_col = if (10.0..=20.0).contains(&secs) { GREEN } else { ui.visuals().text_color() };
+                    ui.label(RichText::new(format!("0:{:02}", secs as u32)).monospace().color(time_col));
+                    level_meter(ui, self.rec.level, 120.0);
+                });
+                let hint = if secs > 1.5 && self.rec.loudest < 1e-4 {
+                    RichText::new(t("No sound is coming in. Check that the microphone isn't muted and that apps may use it (Windows: Settings > Privacy > Microphone).")).small().color(AMBER)
+                } else if secs < 10.0 {
+                    RichText::new(t("Aim for 10–20 seconds.")).small().weak()
+                } else if secs <= 20.0 {
+                    RichText::new(t("Good length. Stop whenever you're done.")).small().color(GREEN)
+                } else {
+                    RichText::new(tf("That's plenty. Stops by itself at {} seconds.", &[&format!("{REC_MAX_SECS:.0}")])).small().weak()
+                };
+                ui.label(hint);
+                ui.ctx().request_repaint_after(Duration::from_millis(33));
+                if stop {
+                    self.stop_recording();
+                }
+            } else if let Some((samples, sr)) = &self.rec.take {
+                // A finished take: listen, name, save or discard
+                let secs = samples.len() as f32 / *sr as f32;
+                let mut listen = false;
+                let mut save = false;
+                let mut discard = false;
+                let mut again = false;
+                let playing = self.player.local_playing();
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(tf("{} s recorded", &[&format!("{secs:.0}")])).small());
+                    let (icon, tip) = if playing { (Icon::Stop, t("Stop")) } else { (Icon::Play, t("Listen")) };
+                    listen = icons::labeled(ui, icon, tip).clicked();
+                    again = icons::labeled(ui, Icon::Refresh, t("Record again")).clicked();
+                });
+                if let Some(issue) = &self.rec.issue {
+                    let msg = match issue {
+                        audio::TakeIssue::Silent => t("The recording is silent. Check the microphone and try again."),
+                        audio::TakeIssue::TooShort => t("Less than 3 seconds of speech. Record a bit more."),
+                        audio::TakeIssue::TooQuiet => t("Very quiet. Move closer to the microphone or turn it up."),
+                        audio::TakeIssue::Clipped => t("It's distorting (too loud). Move back a little or turn the microphone down."),
+                    };
+                    ui.label(RichText::new(msg).small().color(AMBER));
+                }
+                let can_save = !matches!(self.rec.issue, Some(audio::TakeIssue::Silent | audio::TakeIssue::TooShort)) && !self.importing;
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(t("Name")).small().weak());
+                    let r = ui.add(egui::TextEdit::singleline(&mut self.rec.name).desired_width(150.0));
+                    let enter = r.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
+                    save = ui.add_enabled_ui(can_save, |ui| icons::labeled(ui, Icon::Check, t("Save and use"))).inner.clicked() || (enter && can_save);
+                    let tint = if self.rec.confirm_discard { GOLD } else { ui.visuals().widgets.inactive.fg_stroke.color };
+                    if icons::button_tinted(ui, Icon::Trash, tint, t("Discard")).clicked() {
+                        self.rec.confirm_discard = !self.rec.confirm_discard;
+                    }
+                });
+                if self.rec.confirm_discard {
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new(t("Throw this recording away?")).small().color(GOLD));
+                        discard = icons::labeled(ui, Icon::Trash, t("Discard")).clicked();
+                        if ui.button(t("Cancel")).clicked() {
+                            self.rec.confirm_discard = false;
+                        }
+                    });
+                }
+                if listen {
+                    if playing {
+                        self.player.stop_local();
+                    } else {
+                        let (s, r) = (samples.clone(), *sr);
+                        self.player.play_local(&s, r);
+                    }
+                }
+                if playing {
+                    ui.ctx().request_repaint_after(Duration::from_millis(100));
+                }
+                if save {
+                    self.save_recording();
+                } else if discard {
+                    self.player.stop_local();
+                    self.rec.take = None;
+                    self.rec.issue = None;
+                    self.rec.confirm_discard = false;
+                } else if again {
+                    self.start_recording();
+                }
+            } else {
+                // Ready to record
+                ui.horizontal(|ui| {
+                    let r = ui.add_enabled_ui(!self.importing, |ui| icons::labeled_tinted(ui, Icon::Mic, RED, t("Record"))).inner;
+                    if r.clicked() {
+                        self.start_recording();
+                    }
+                    ui.label(RichText::new(t("Your recording stays on this PC.")).small().weak());
+                });
+            }
+            if let Some(e) = &self.rec.error {
+                ui.label(RichText::new(e.text()).small().color(RED));
             }
         });
     }
@@ -2179,6 +2509,21 @@ impl App {
             if self.cfg.ui_lang != before {
                 i18n::set_lang(&self.cfg.ui_lang);
                 self.cfg.save();
+            }
+
+            if tray::supported() {
+                ui.add_space(8.0);
+                ui.label(RichText::new(t("Minimize to")).small().weak());
+                ui.horizontal(|ui| {
+                    let mut changed = ui.radio_value(&mut self.cfg.minimize_to_tray, false, t("Taskbar")).changed();
+                    changed |= ui.radio_value(&mut self.cfg.minimize_to_tray, true, t("System tray (next to the clock)")).changed();
+                    if changed {
+                        self.cfg.save();
+                    }
+                });
+                if self.cfg.minimize_to_tray {
+                    ui.label(RichText::new(t("To bring it back, click the Corvox icon next to the clock (Windows may tuck it under ^) or press the shortcut.")).small().weak());
+                }
             }
 
             ui.add_space(8.0);
@@ -2365,7 +2710,7 @@ impl App {
                 Some(p) => tf("Downloading {}", &[&p]),
                 None => format!("{} · {}", self.cfg.language.to_uppercase(), self.engine().map(|e| short_name(&e.name)).unwrap_or_default()),
             };
-            let w = ui.available_width() - 98.0 - tag.chars().count() as f32 * 6.2;
+            let w = ui.available_width() - 124.0 - tag.chars().count() as f32 * 6.2;
             self.text_box(ui, w.max(110.0));
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 if self.busy() {
@@ -2379,6 +2724,9 @@ impl App {
                 }
                 if icons::button(ui, Icon::ChevronUp, t("Expand")).clicked() {
                     self.expand(true);
+                }
+                if icons::button(ui, Icon::Minimize, self.minimize_tip()).clicked() {
+                    self.minimize();
                 }
                 self.snap_widget(ui);
                 let col = if self.error.is_some() { RED } else { ui.visuals().weak_text_color() };
@@ -2396,7 +2744,10 @@ impl App {
         self.frames += 1;
         let main_ready = self.helpers.get(&self.main_key).map(|h| h.ready).unwrap_or(false);
         let waiting = std::env::var("CORVOX_SAY").is_ok() && (self.busy() || self.queued.is_some() || !main_ready);
-        if waiting && self.frames < 2400 {
+        // CORVOX_SHOT_READY: wait until the engine has its model loaded.
+        let loaded = self.helpers.get(&self.main_key).is_some_and(|h| h.ready && h.loading.is_none() && !h.loaded.is_empty());
+        let not_ready = std::env::var_os("CORVOX_SHOT_READY").is_some() && !(loaded && self.status == Status::Ready);
+        if (waiting || not_ready) && self.frames < 2400 {
             self.frames = self.frames.min(38);
         }
         let wait_frames = std::env::var("CORVOX_SHOT_AFTER").ok().and_then(|s| s.parse::<u32>().ok()).map(|secs| secs * 20).unwrap_or(40);
@@ -2559,6 +2910,28 @@ fn short_name(name: &str) -> String {
         .replace("Pocket TTS Large", "Pocket L")
         .replace("Pocket TTS", "Pocket")
         .replace(" Multilingual", "")
+}
+
+/// Microphone level bar: -60 dB to 0 dB, green while speaking normally, amber when very
+/// quiet, red near clipping.
+fn level_meter(ui: &mut egui::Ui, peak: f32, width: f32) {
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(width, 8.0), Sense::hover());
+    let p = ui.painter();
+    p.rect_filled(rect, CornerRadius::same(4), ui.visuals().extreme_bg_color);
+    let db = 20.0 * peak.max(1e-6).log10();
+    let frac = ((db + 60.0) / 60.0).clamp(0.0, 1.0);
+    let col = if peak > 0.95 {
+        RED
+    } else if peak < 0.03 {
+        AMBER
+    } else {
+        GREEN
+    };
+    if frac > 0.0 {
+        let mut fill = rect;
+        fill.set_width(width * frac);
+        p.rect_filled(fill, CornerRadius::same(4), col);
+    }
 }
 
 fn truncate(s: &str, n: usize) -> String {

@@ -72,6 +72,37 @@ mod imp {
             (raw != 0).then_some(Self(raw as HWND))
         }
 
+        pub fn raw(&self) -> isize {
+            self.0 as isize
+        }
+
+        /// Sets the big window icon (taskbar button, Alt+Tab). winit only sets the small one.
+        pub fn set_big_icon(&self, rgba: &[u8], size: u32) {
+            use windows_sys::Win32::Graphics::Gdi::{CreateBitmap, DeleteObject};
+            use windows_sys::Win32::UI::WindowsAndMessaging::{CreateIconIndirect, SendMessageW, ICONINFO, ICON_BIG, WM_SETICON};
+            let bgra: Vec<u8> = rgba.chunks_exact(4).flat_map(|p| [p[2], p[1], p[0], p[3]]).collect();
+            let mask = vec![0u8; (size.div_ceil(16) * 2 * size) as usize]; // 1 bit per pixel, unused: alpha decides
+            unsafe {
+                let color_bm = CreateBitmap(size as i32, size as i32, 1, 32, bgra.as_ptr() as _);
+                let mask_bm = CreateBitmap(size as i32, size as i32, 1, 1, mask.as_ptr() as _);
+                let info = ICONINFO { fIcon: 1, xHotspot: 0, yHotspot: 0, hbmMask: mask_bm, hbmColor: color_bm };
+                let icon = CreateIconIndirect(&info);
+                DeleteObject(color_bm as _);
+                DeleteObject(mask_bm as _);
+                if !icon.is_null() {
+                    SendMessageW(self.0, WM_SETICON, ICON_BIG as usize, icon as isize);
+                }
+            }
+        }
+
+        /// Hides the window completely (no taskbar button), for "minimize to tray".
+        pub fn hide(&self) {
+            use windows_sys::Win32::UI::WindowsAndMessaging::SW_HIDE;
+            unsafe {
+                ShowWindow(self.0, SW_HIDE);
+            }
+        }
+
         pub fn is_foreground(&self) -> bool {
             unsafe { GetForegroundWindow() == self.0 }
         }
@@ -119,6 +150,11 @@ mod imp {
     pub struct Window;
 
     impl Window {
+        pub fn raw(&self) -> isize {
+            0
+        }
+        pub fn hide(&self) {}
+        pub fn set_big_icon(&self, _rgba: &[u8], _size: u32) {}
         pub fn from(_w: &impl raw_window_handle::HasWindowHandle) -> Option<Self> {
             None
         }
@@ -145,6 +181,50 @@ mod imp {
 }
 
 pub use imp::Window;
+
+/// Whether the window `raw` is hidden (minimized to the tray).
+#[cfg(windows)]
+pub fn is_hidden_raw(raw: isize) -> bool {
+    use windows_sys::Win32::UI::WindowsAndMessaging::IsWindowVisible;
+    raw != 0 && unsafe { IsWindowVisible(raw as _) } == 0
+}
+
+/// Shows a hidden (or minimized) window again and brings it to the front.
+#[cfg(windows)]
+pub fn show_raw(raw: isize) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{ShowWindow, SW_SHOW};
+    if raw == 0 {
+        return;
+    }
+    unsafe {
+        ShowWindow(raw as _, SW_SHOW);
+    }
+    if let Some(w) = Window::from_raw(raw) {
+        w.focus();
+    }
+}
+
+/// Asks the window to close, the same as its close button (works while it's hidden).
+#[cfg(windows)]
+pub fn close_raw(raw: isize) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_CLOSE};
+    if raw != 0 {
+        unsafe {
+            PostMessageW(raw as _, WM_CLOSE, 0, 0);
+        }
+    }
+}
+
+#[cfg(not(windows))]
+pub fn is_hidden_raw(_raw: isize) -> bool {
+    false
+}
+
+#[cfg(not(windows))]
+pub fn show_raw(_raw: isize) {}
+
+#[cfg(not(windows))]
+pub fn close_raw(_raw: isize) {}
 
 /// True when the OS draws rounded corners for us (Windows 11), so we paint square ones.
 pub fn native_corners() -> bool {

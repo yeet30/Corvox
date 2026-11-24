@@ -9,6 +9,7 @@ mod i18n;
 mod icons;
 mod platform;
 mod ptt;
+mod tray;
 mod update;
 mod vmic;
 
@@ -28,7 +29,8 @@ fn main() -> eframe::Result {
         .with_min_inner_size(app::COLLAPSED)
         .with_decorations(false)
         .with_transparent(!platform::native_corners())
-        .with_resizable(false);
+        .with_resizable(false)
+        .with_icon(icons::app_icon());
     if cfg.always_on_top {
         viewport = viewport.with_always_on_top();
     }
@@ -36,6 +38,14 @@ fn main() -> eframe::Result {
         // Testing: open off-screen without taking focus or a taskbar button.
         viewport = viewport.with_position([-4000.0, -4000.0]).with_active(false).with_taskbar(false);
     }
-    let options = eframe::NativeOptions { viewport, ..Default::default() };
+    // Draw the UI on the power-saving GPU (the integrated one on laptops). The engines put their
+    // models on the fast GPU, and sharing its memory with them could crash the renderer.
+    let mut wgpu_options = eframe::WgpuConfiguration::default();
+    if let eframe::egui_wgpu::WgpuSetup::CreateNew(setup) = &mut wgpu_options.wgpu_setup {
+        if std::env::var_os("WGPU_POWER_PREF").is_none() {
+            setup.power_preference = eframe::wgpu::PowerPreference::LowPower;
+        }
+    }
+    let options = eframe::NativeOptions { viewport, wgpu_options, ..Default::default() };
     eframe::run_native(app::APP_NAME, options, Box::new(move |cc| Ok(Box::new(app::App::new(cc, cfg)))))
 }

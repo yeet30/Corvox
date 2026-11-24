@@ -46,6 +46,8 @@ pub struct Config {
     pub pinned: Vec<String>,
     /// Name of the output device that feeds Discord (e.g. "CABLE Input"). None = auto-detect.
     pub output_device: Option<String>,
+    /// Microphone for recording a voice (None: the system default).
+    pub input_device: Option<String>,
     /// Also play to the default speakers/headphones so you hear yourself.
     pub monitor: bool,
     pub monitor_volume: f32,
@@ -74,6 +76,8 @@ pub struct Config {
     pub snap: Option<Corner>,
     /// Look for a new release on GitHub when Corvox starts.
     pub check_updates: bool,
+    /// The minimize button (and Esc) hides Corvox to the tray instead of the taskbar.
+    pub minimize_to_tray: bool,
 }
 
 impl Default for Config {
@@ -85,6 +89,7 @@ impl Default for Config {
             recent: vec![],
             pinned: vec![],
             output_device: None,
+            input_device: None,
             monitor: true,
             monitor_volume: 0.6,
             ptt_key: None,
@@ -101,6 +106,7 @@ impl Default for Config {
             downloaded: vec![],
             snap: None,
             check_updates: true,
+            minimize_to_tray: false,
         }
     }
 }

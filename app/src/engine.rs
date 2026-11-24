@@ -42,6 +42,8 @@ pub enum Event {
     UpdateChecked { result: Result<Option<crate::update::Release>, String>, manual: bool },
     UpdateProgress { done: u64, total: u64 },
     UpdateDone { result: Result<(), String> },
+    /// The window came back from the tray.
+    Restored,
 }
 
 pub type Tx = (Sender<Event>, eframe::egui::Context);

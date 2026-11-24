@@ -36,6 +36,7 @@ pub enum Icon {
     Volume,
     VolumeOff,
     Pause,
+    Minimize,
 }
 
 impl Icon {
@@ -63,6 +64,7 @@ impl Icon {
             Icon::VolumeOff => ("volume-off", svg!(r#"<path d="M4 9h4l5-4v14l-5-4H4z"/><path d="M17 9l5 6M22 9l-5 6"/>"#)),
             Icon::Pause => ("pause", svg!(r#"<rect x="6" y="5" width="4" height="14" rx="1" fill="white"/><rect x="14" y="5" width="4" height="14" rx="1" fill="white"/>"#)),
             Icon::Send => ("send", svg!(r#"<path d="M4 12l16-8-6 16-2.5-6.5z"/>"#)),
+            Icon::Minimize => ("minimize", svg!(r#"<path d="M6 17h12"/>"#)),
         };
         (name, s.as_bytes())
     }
@@ -93,4 +95,32 @@ pub fn labeled(ui: &mut Ui, icon: Icon, text: &str) -> Response {
 
 pub fn small(ui: &mut Ui, icon: Icon, tint: Color32) {
     ui.add(icon.image(14.0, tint));
+}
+
+/// Normal button with a colored icon on the left.
+pub fn labeled_tinted(ui: &mut Ui, icon: Icon, tint: Color32, text: &str) -> Response {
+    ui.add(egui::Button::image_and_text(icon.image(14.0, tint), text)).on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+include!("app_icon.rs");
+
+pub fn app_icon() -> egui::IconData {
+    let (rgba, size) = app_icon_rgba(64);
+    egui::IconData { rgba, width: size, height: size }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn app_icon_is_a_mic_on_a_rounded_square() {
+        let (px, n) = super::app_icon_rgba(64);
+        let at = |x: u32, y: u32| &px[((y * n + x) * 4) as usize..((y * n + x) * 4 + 4) as usize];
+        assert_eq!(at(0, 0)[3], 0, "corners are transparent");
+        assert_eq!(at(6, 32), &[0x2F, 0x6F, 0xDE, 255], "blue background");
+        assert_eq!(at(32, 22), &[255, 255, 255, 255], "white mic in the middle");
+        if let Ok(path) = std::env::var("CORVOX_ICON_DUMP") {
+            let (big, s) = super::app_icon_rgba(256);
+            image::RgbaImage::from_raw(s, s, big).unwrap().save(path).unwrap();
+        }
+    }
 }

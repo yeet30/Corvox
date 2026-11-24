@@ -2,6 +2,7 @@
 
 use std::collections::VecDeque;
 use std::path::Path;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{anyhow, Context, Result};
@@ -320,6 +321,179 @@ impl Player {
             s.queue.lock().unwrap().clear();
         }
     }
+
+    fn local_sink(&self) -> Option<&Sink> {
+        self.monitor.as_ref().or(self.local.as_ref())
+    }
+
+    /// Whether something from [`Player::play_local`] is still playing.
+    pub fn local_playing(&self) -> bool {
+        self.local_sink().is_some_and(|s| !s.queue.lock().unwrap().is_empty())
+    }
+
+    pub fn stop_local(&self) {
+        if let Some(s) = self.local_sink() {
+            s.queue.lock().unwrap().clear();
+        }
+    }
+}
+
+// ---------- recording from a microphone ----------
+
+/// Input devices that are really the virtual cable (recording those captures Corvox itself).
+fn looks_virtual(name: &str) -> bool {
+    const HINTS: [&str; 6] = ["cable output", "vb-audio", "blackhole", "corvox", "monitor of", "loopback"];
+    let n = name.to_lowercase();
+    HINTS.iter().any(|h| n.contains(h))
+}
+
+pub fn input_device_names() -> Vec<String> {
+    cpal::default_host()
+        .input_devices()
+        .map(|it| it.filter_map(|d| d.description().ok().map(|x| x.name().to_string())).collect())
+        .unwrap_or_default()
+}
+
+/// The microphone used when none is chosen: the system's default recording device, unless
+/// that's the virtual cable, then the first real one.
+pub fn default_input_name() -> Option<String> {
+    let default = cpal::default_host().default_input_device().and_then(|d| d.description().ok()).map(|d| d.name().to_string());
+    match default {
+        Some(d) if !looks_virtual(&d) => Some(d),
+        other => input_device_names().into_iter().find(|n| !looks_virtual(n)).or(other),
+    }
+}
+
+/// Recordings stop growing here, even if nobody presses Stop.
+const MAX_RECORD_SECONDS: f32 = 60.0;
+
+/// A running microphone recording: mono samples at the device's rate, plus a live level.
+pub struct Recorder {
+    _stream: cpal::Stream,
+    samples: Arc<Mutex<Vec<f32>>>,
+    /// Loudest sample since the UI last looked (f32 bits).
+    peak: Arc<AtomicU32>,
+    pub rate: u32,
+}
+
+impl Recorder {
+    /// Starts recording from `device` (by name), or the default microphone.
+    pub fn start(device: Option<&str>) -> Result<Self> {
+        let host = cpal::default_host();
+        let name = device.map(String::from).or_else(default_input_name).ok_or_else(|| anyhow!("no microphone found"))?;
+        let dev = host
+            .input_devices()?
+            .find(|d| d.description().map(|x| x.name() == name).unwrap_or(false))
+            .ok_or_else(|| anyhow!("microphone \"{name}\" not found"))?;
+        let cfg = dev.default_input_config()?;
+        let rate = cfg.sample_rate();
+        let channels = cfg.channels() as usize;
+        let samples = Arc::new(Mutex::new(Vec::with_capacity(rate as usize * 30)));
+        let peak = Arc::new(AtomicU32::new(0));
+        let max = (MAX_RECORD_SECONDS * rate as f32) as usize;
+        let (s, p) = (samples.clone(), peak.clone());
+        let stream = match cfg.sample_format() {
+            cpal::SampleFormat::F32 => build_input::<f32>(&dev, cfg.into(), channels, max, s, p)?,
+            cpal::SampleFormat::I16 => build_input::<i16>(&dev, cfg.into(), channels, max, s, p)?,
+            cpal::SampleFormat::U16 => build_input::<u16>(&dev, cfg.into(), channels, max, s, p)?,
+            cpal::SampleFormat::I32 => build_input::<i32>(&dev, cfg.into(), channels, max, s, p)?,
+            cpal::SampleFormat::U8 => build_input::<u8>(&dev, cfg.into(), channels, max, s, p)?,
+            f => return Err(anyhow!("unsupported microphone format {f}")),
+        };
+        stream.play()?;
+        Ok(Self { _stream: stream, samples, peak, rate })
+    }
+
+    /// The loudest sample since the last call (0–1).
+    pub fn take_peak(&self) -> f32 {
+        f32::from_bits(self.peak.swap(0, Ordering::Relaxed))
+    }
+
+    pub fn seconds(&self) -> f32 {
+        self.samples.lock().unwrap().len() as f32 / self.rate as f32
+    }
+
+    /// Stops recording and hands over what was captured.
+    pub fn finish(self) -> (Vec<f32>, u32) {
+        let rate = self.rate;
+        let samples = std::mem::take(&mut *self.samples.lock().unwrap());
+        drop(self);
+        (samples, rate)
+    }
+}
+
+fn build_input<T>(
+    device: &cpal::Device,
+    config: cpal::StreamConfig,
+    channels: usize,
+    max: usize,
+    samples: Arc<Mutex<Vec<f32>>>,
+    peak: Arc<AtomicU32>,
+) -> Result<cpal::Stream>
+where
+    T: SizedSample,
+    f32: FromSample<T>,
+{
+    let channels = channels.max(1);
+    let stream = device.build_input_stream(
+        config,
+        move |data: &[T], _| {
+            let mut buf = samples.lock().unwrap();
+            let mut loudest = 0.0f32;
+            for frame in data.chunks(channels) {
+                let v = frame.iter().map(|s| s.to_sample::<f32>()).sum::<f32>() / channels as f32;
+                loudest = loudest.max(v.abs());
+                if buf.len() < max {
+                    buf.push(v);
+                }
+            }
+            // For non-negative floats the bit patterns sort like the numbers.
+            peak.fetch_max(loudest.to_bits(), Ordering::Relaxed);
+        },
+        |e| eprintln!("microphone stream error: {e}"),
+        None,
+    )?;
+    Ok(stream)
+}
+
+/// How a finished recording sounds, for a hint before saving it.
+#[derive(Debug, PartialEq)]
+pub enum TakeIssue {
+    Silent,
+    TooQuiet,
+    Clipped,
+    TooShort,
+}
+
+pub fn check_take(samples: &[f32], sr: u32) -> Option<TakeIssue> {
+    let peak = samples.iter().fold(0.0f32, |m, s| m.max(s.abs()));
+    if peak < 1e-4 {
+        return Some(TakeIssue::Silent);
+    }
+    let speech = tidy_clip(samples, sr).len() as f32 / sr as f32;
+    if speech < 3.0 {
+        return Some(TakeIssue::TooShort);
+    }
+    if peak < 0.03 {
+        return Some(TakeIssue::TooQuiet);
+    }
+    let clipped = samples.iter().filter(|s| s.abs() > 0.99).count();
+    if clipped as f32 > sr as f32 * 0.005 {
+        return Some(TakeIssue::Clipped);
+    }
+    None
+}
+
+/// Saves a recording as a voice reference, cleaned up like an imported file. Returns its
+/// length in seconds.
+pub fn save_take(samples: &[f32], sr: u32, dest: &Path) -> Result<f32> {
+    let clip = tidy_clip(&resample(samples, sr, VOICE_SR), VOICE_SR);
+    let secs = clip.len() as f32 / VOICE_SR as f32;
+    if secs < 2.0 {
+        return Err(anyhow!("the recording has less than 2 seconds of speech"));
+    }
+    write_wav(dest, &clip, VOICE_SR)?;
+    Ok(secs)
 }
 
 #[cfg(test)]
@@ -351,6 +525,23 @@ mod tests {
         let peak = r.into_samples::<i16>().flatten().map(|s| (s as i32).abs()).max().unwrap();
         assert!(peak > 28_000, "peak should be normalized to about -1 dBFS, got {peak}");
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn checks_a_recording_before_saving() {
+        let sr = 48_000;
+        let tone = |secs: f32, amp: f32| -> Vec<f32> { (0..(secs * sr as f32) as usize).map(|i| (i as f32 * 0.05).sin() * amp).collect() };
+        assert_eq!(check_take(&vec![0.0; sr as usize * 5], sr), Some(TakeIssue::Silent));
+        assert_eq!(check_take(&tone(1.5, 0.5), sr), Some(TakeIssue::TooShort));
+        assert_eq!(check_take(&tone(6.0, 0.01), sr), Some(TakeIssue::TooQuiet));
+        assert_eq!(check_take(&tone(6.0, 1.5).iter().map(|s| s.clamp(-1.0, 1.0)).collect::<Vec<_>>(), sr), Some(TakeIssue::Clipped));
+        assert_eq!(check_take(&tone(6.0, 0.5), sr), None);
+
+        let dest = std::env::temp_dir().join(format!("corvox-take-{}.wav", std::process::id()));
+        let secs = save_take(&tone(6.0, 0.5), sr, &dest).unwrap();
+        assert!((5.8..6.1).contains(&secs), "got {secs}");
+        assert_eq!(hound::WavReader::open(&dest).unwrap().spec().sample_rate, VOICE_SR);
+        let _ = std::fs::remove_file(dest);
     }
 
     #[test]

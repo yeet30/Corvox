@@ -3,12 +3,15 @@
 Type a line, hear it in **your own voice** in Discord (or any app with a mic setting).
 
 <p align="center"><img src="docs/main.png" width="440" alt="Main window"> <img src="docs/engines.png" width="440" alt="Engine picker with measured stats"></p>
+<p align="center"><img src="docs/voices.png" width="440" alt="Voices page with the recorder"> <img src="docs/settings-tr.png" width="440" alt="Settings in Turkish"></p>
 <p align="center"><img src="docs/pill.png" width="460" alt="Collapsed bar"></p>
 
-Corvox copies your voice from a short clip (10–20 seconds, any audio file) and speaks whatever you type into a virtual microphone. Discord just sees a mic. No bot, no Discord tokens, and your text and voice never leave your PC (only the models are downloaded).
+Corvox copies your voice from a short clip (10–20 seconds: record it in the app, or use any audio file) and speaks whatever you type into a virtual microphone. Discord just sees a mic. No bot, no Discord tokens, and your text and voice never leave your PC (only the models are downloaded).
 
 - Small native window (Rust + egui), collapses into a one-line bar (drag it from anywhere). The bar's four-arrow button sticks it to a screen corner: click the arrow toward a corner, click it again to unstick
+- Minimize to the taskbar, or (Windows) to the system tray next to the clock: pick one in Settings. The tray icon or the shortcut brings Corvox back
 - A global shortcut brings Corvox up; press it again to go back to the window you were in
+- Record your voice right in the app (Voices page): pick a microphone, read the text shown, watch the level meter, listen back, save. It warns when a take is silent, too short, too quiet or distorted
 - Recent and pinned phrases: click one, or use ↑/↓, to say it again. Their audio is saved, so they replay instantly without the engine (can be turned off, and you choose how many to keep)
 - Engines install and download in the background with Pause/Resume, while the current one keeps working; a chime plays when one is ready
 - Switching engines: the one you left stays loaded for 3 minutes, so switching back is instant (its process quits after 10 minutes)
@@ -82,7 +85,7 @@ Corvox picks the cable automatically. You can change it in Settings.
 
 ### 3. First run
 
-1. **Voice** button: pick an MP3/WAV/M4A of you talking for 10–20 s, no music or noise.
+1. **Voice** button: press **Record** and read the text shown for 10–20 s, or pick an MP3/WAV/M4A of you talking. No music or noise.
 2. **Engine** button: pick your language, install an engine, select it.
 3. Type, press Enter.
 
@@ -133,7 +136,7 @@ Debug switches (environment variables):
 - `CORVOX_ENVS=<dir>`: use a separate folder for engine environments
 - `CORVOX_ENGINES=<dir>`: where `engines/` is
 - `CORVOX_SAY="text"`: speak this on startup
-- `CORVOX_SHOT=out.png` (+ `CORVOX_SHOT_PAGE=engines|voices|settings`, `CORVOX_SHOT_AFTER=<secs>`): save a screenshot and quit
+- `CORVOX_SHOT=out.png` (+ `CORVOX_SHOT_PAGE=engines|voices|settings`, `CORVOX_SHOT_AFTER=<secs>`, `CORVOX_SHOT_READY=1` to wait until the engine is loaded): save a screenshot and quit
 - `CORVOX_INSTALL=<env>`: start installing an engine environment on launch
 - `CORVOX_OFFSCREEN=1`: open off-screen without taking focus (for screenshots)
 - `CORVOX_THREADS=n`: CPU threads for Pocket engines (default 4)
