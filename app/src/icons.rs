@@ -112,12 +112,14 @@ pub fn app_icon() -> egui::IconData {
 #[cfg(test)]
 mod tests {
     #[test]
-    fn app_icon_is_a_mic_on_a_rounded_square() {
+    fn app_icon_is_a_crow_mic_on_a_white_tile() {
         let (px, n) = super::app_icon_rgba(64);
         let at = |x: u32, y: u32| &px[((y * n + x) * 4) as usize..((y * n + x) * 4 + 4) as usize];
         assert_eq!(at(0, 0)[3], 0, "corners are transparent");
-        assert_eq!(at(6, 32), &[0x2F, 0x6F, 0xDE, 255], "blue background");
-        assert_eq!(at(32, 22), &[255, 255, 255, 255], "white mic in the middle");
+        assert_eq!(at(6, 32), &[255, 255, 255, 255], "white tile");
+        assert_eq!(at(28, 22), &[0x11, 0x11, 0x11, 255], "black crow head");
+        assert_eq!(at(32, 40), &[255, 255, 255, 255], "gap between head and stand");
+        assert_eq!(at(32, 48), &[0x11, 0x11, 0x11, 255], "black stand");
         if let Ok(path) = std::env::var("CORVOX_ICON_DUMP") {
             let (big, s) = super::app_icon_rgba(256);
             image::RgbaImage::from_raw(s, s, big).unwrap().save(path).unwrap();
