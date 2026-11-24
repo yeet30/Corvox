@@ -177,6 +177,14 @@ impl Config {
     }
 
     /// Applies `phrase_limit`, returning what was removed. Pinned phrases don't count toward it.
+    /// Forgets every recent phrase that isn't pinned. Returns the ones removed.
+    pub fn clear_recent(&mut self) -> Vec<String> {
+        let pinned = self.pinned.clone();
+        let (keep, removed): (Vec<String>, Vec<String>) = std::mem::take(&mut self.recent).into_iter().partition(|t| pinned.contains(t));
+        self.recent = keep;
+        removed
+    }
+
     pub fn trim_recent(&mut self) -> Vec<String> {
         let limit = self.phrase_limit.clamp(1, MAX_PHRASE_LIMIT);
         let pinned = self.pinned.clone();
@@ -279,4 +287,19 @@ pub fn save_hf_token(token: &str) -> std::io::Result<()> {
         std::fs::create_dir_all(d)?;
     }
     std::fs::write(p, token.trim())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn clearing_recent_keeps_pinned() {
+        let mut c = Config { recent: vec!["a".into(), "pin".into(), "b".into()], pinned: vec!["pin".into()], ..Default::default() };
+        let removed = c.clear_recent();
+        assert_eq!(removed, vec!["a".to_string(), "b".to_string()]);
+        assert_eq!(c.recent, vec!["pin".to_string()]);
+        assert_eq!(c.pinned, vec!["pin".to_string()]);
+        assert!(c.clear_recent().is_empty());
+    }
 }

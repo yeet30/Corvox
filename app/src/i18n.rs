@@ -369,6 +369,10 @@ fn tr(en: &str) -> Option<&'static str> {
             "\"{}\" sesi silinsin mi? Ses dosyası kalıcı olarak silinir. Kullanılan ses bu, Corvox başka birine geçer."
         }
         "Throw this recording away?" => "Bu kayıt atılsın mı?",
+        "Clear recent phrases" => "Son cümleleri temizle",
+        "Clear 1 recent phrase and its saved audio? Pinned phrases stay." => "1 son cümle ve kayıtlı sesi silinsin mi? Sabitlenenler kalır.",
+        "Clear {} recent phrases and their saved audio? Pinned phrases stay." => "{} son cümle ve kayıtlı sesleri silinsin mi? Sabitlenenler kalır.",
+        "Clear" => "Temizle",
         "Minimize" => "Simge durumuna küçült",
         "Minimize to the tray" => "Sistem tepsisine küçült",
         "Minimize to" => "Küçültünce",

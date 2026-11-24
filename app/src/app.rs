@@ -218,6 +218,8 @@ pub struct App {
     delete_prompt: Option<String>,
     /// Voice clip waiting for "are you sure?" before it's deleted.
     voice_delete_prompt: Option<String>,
+    /// "Clear recent phrases?" is showing on the main page.
+    confirm_clear_phrases: bool,
     deleting: HashSet<String>,
     cache_msg: Option<Msg>,
     cleaning_cache: bool,
@@ -240,6 +242,8 @@ pub struct App {
     upd: Upd,
     /// The tray icon while Corvox is minimized to the tray.
     tray: Option<tray::Tray>,
+    /// The app icon for the title bar, drawn at the screen's pixel size.
+    title_icon: Option<(u32, egui::TextureHandle)>,
     /// Running from a release folder we can write to, so updates can install themselves.
     self_update_ok: bool,
     /// Installed engine environments whose packages are being brought up to date after an
@@ -318,6 +322,7 @@ impl App {
             agree_prompt: None,
             delete_prompt: None,
             voice_delete_prompt: None,
+            confirm_clear_phrases: false,
             deleting: HashSet::new(),
             cache_msg: None,
             cleaning_cache: false,
@@ -336,6 +341,7 @@ impl App {
             snap_pending: true,
             upd: Upd::Idle,
             tray: None,
+            title_icon: None,
             self_update_ok: update::can_self_update(),
             resyncing: HashSet::new(),
         };
@@ -758,6 +764,20 @@ impl App {
                 let _ = std::fs::remove_file(&p);
             }
         }
+    }
+
+    /// Recent phrases that aren't pinned (what "Clear recent phrases" removes).
+    fn clearable_phrases(&self) -> usize {
+        self.cfg.recent.iter().filter(|r| !self.cfg.pinned.contains(r)).count()
+    }
+
+    /// Removes every recent phrase that isn't pinned, with its saved audio.
+    fn clear_recent_phrases(&mut self) {
+        let removed = self.cfg.clear_recent();
+        self.forget_phrases(&removed);
+        self.history_pos = None;
+        self.confirm_clear_phrases = false;
+        self.cfg.save();
     }
 
     fn forget_phrases(&mut self, removed: &[String]) {
@@ -1381,7 +1401,8 @@ impl App {
             }
         }
         ui.scope_builder(UiBuilder::new().max_rect(rect).layout(Layout::left_to_right(Align::Center)), |ui| {
-            icons::small(ui, Icon::Mic, ui.visuals().text_color());
+            let icon = self.title_icon(ui.ctx());
+            ui.add(egui::Image::new((icon, Vec2::splat(18.0))));
             ui.label(RichText::new(APP_NAME).color(ui.visuals().text_color()));
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 if icons::button(ui, Icon::Close, t("Close")).clicked() {
@@ -1421,6 +1442,17 @@ impl App {
                 }
             });
         });
+    }
+
+    /// The app icon as a texture, redrawn crisply whenever the display scale changes.
+    fn title_icon(&mut self, ctx: &egui::Context) -> egui::TextureId {
+        let px = (18.0 * ctx.pixels_per_point()).round().max(18.0) as u32;
+        if self.title_icon.as_ref().map(|(size, _)| *size) != Some(px) {
+            let (rgba, n) = icons::app_icon_rgba(px);
+            let img = egui::ColorImage::from_rgba_unmultiplied([n as usize, n as usize], &rgba);
+            self.title_icon = Some((px, ctx.load_texture("app-icon", img, egui::TextureOptions::LINEAR)));
+        }
+        self.title_icon.as_ref().map(|(_, t)| t.id()).unwrap_or_default()
     }
 
     fn text_box(&mut self, ui: &mut egui::Ui, width: f32) {
@@ -1571,11 +1603,37 @@ impl App {
         self.error_line(ui);
         self.vmic_notice(ui);
         ui.add_space(2.0);
+        let clearable = self.clearable_phrases();
+        if clearable == 0 {
+            self.confirm_clear_phrases = false;
+        }
         ui.horizontal(|ui| {
             let label = if self.cfg.keep_phrases { t("Recent") } else { t("Pinned") };
             ui.label(RichText::new(label).small().weak()).on_hover_text(t("↑↓ to choose · Enter speaks · right-click to edit"));
+            if clearable > 0 {
+                let tint = if self.confirm_clear_phrases { GOLD } else { ui.visuals().weak_text_color() };
+                if icons::button_tinted(ui, Icon::Trash, tint, t("Clear recent phrases")).clicked() {
+                    self.confirm_clear_phrases = !self.confirm_clear_phrases;
+                }
+            }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| self.volume_control(ui));
         });
+        if self.confirm_clear_phrases {
+            ui.horizontal_wrapped(|ui| {
+                let msg = if clearable == 1 {
+                    t("Clear 1 recent phrase and its saved audio? Pinned phrases stay.").to_string()
+                } else {
+                    tf("Clear {} recent phrases and their saved audio? Pinned phrases stay.", &[&clearable.to_string()])
+                };
+                ui.label(RichText::new(msg).small().color(GOLD));
+                if icons::labeled(ui, Icon::Trash, t("Clear")).clicked() {
+                    self.clear_recent_phrases();
+                }
+                if ui.button(t("Cancel")).clicked() {
+                    self.confirm_clear_phrases = false;
+                }
+            });
+        }
 
         let list = self.phrase_list();
         let keys: Vec<Option<String>> = list.iter().map(|p| self.phrase_key(p)).collect();
